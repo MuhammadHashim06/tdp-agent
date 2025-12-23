@@ -210,6 +210,25 @@ export default function CaseDetailPage(props) {
         return name.split(' ').map(n => n[0]).join('').toUpperCase().slice(0, 2);
     };
 
+    const handleGenerate = async () => {
+        setIsSubmitting(true);
+        setStatusMessage('Generating...');
+        try {
+            await api.createAcceptanceDraft(id);
+            setSuccessMessage("Acceptance draft generated!");
+            setTimeout(() => {
+                setSuccessMessage(null);
+                fetchCaseData(id);
+            }, 1000);
+        } catch (err) {
+            console.error(err);
+            setError("Failed to generate draft.");
+        } finally {
+            setIsSubmitting(false);
+            setStatusMessage('');
+        }
+    };
+
     if (loading) return <div className="flex justify-center p-12"><div className="animate-spin rounded-full h-8 w-8 border-b-2 border-indigo-600"></div></div>;
     if (error) return <div className="p-8 text-red-500">{error}</div>;
     if (!caseDetail) return null;
@@ -226,13 +245,46 @@ export default function CaseDetailPage(props) {
                     <h1 className="text-2xl font-bold text-gray-900 dark:text-white">{caseDetail.title}</h1>
                     <p className="text-sm text-gray-500">Full case history and metadata.</p>
                 </div>
-                <button
-                    onClick={() => fetchCaseData(id)}
-                    className="px-3 py-1.5 bg-white border border-gray-300 rounded text-sm hover:bg-gray-50 dark:bg-zinc-800 dark:border-zinc-700 dark:text-white"
-                >
-                    Case Actions
-                </button>
+                <div className="flex gap-2">
+                    {/* Generate Button - Always Visible */}
+                    <button
+                        onClick={handleGenerate}
+                        disabled={isSubmitting}
+                        className="px-3 py-1.5 bg-white border border-gray-300 rounded text-sm hover:bg-gray-50 dark:bg-zinc-800 dark:border-zinc-700 dark:text-white flex items-center gap-1"
+                    >
+                        <span>📄</span> Generate
+                    </button>
+
+                    {/* Conditional Action Buttons */}
+                    {caseDetail.status === 'pending staffing' ? (
+                        <button
+                            onClick={() => setIsStaffingModalOpen(true)}
+                            className="px-4 py-1.5 bg-indigo-600 text-white rounded text-sm font-medium hover:bg-indigo-700 shadow-sm"
+                        >
+                            Pending Staff
+                        </button>
+                    ) : (
+                        <button
+                            onClick={() => setIsUpdateModalOpen(true)}
+                            className="px-3 py-1.5 bg-white border border-gray-300 rounded text-sm hover:bg-gray-50 dark:bg-zinc-800 dark:border-zinc-700 dark:text-white"
+                        >
+                            Update Status
+                        </button>
+                    )}
+                </div>
             </div>
+
+            {/* Notification Messages */}
+            {successMessage && (
+                <div className="bg-green-100 border border-green-400 text-green-700 px-4 py-3 rounded relative" role="alert">
+                    <span className="block sm:inline">{successMessage}</span>
+                </div>
+            )}
+            {statusMessage && (
+                <div className="fixed bottom-4 right-4 bg-gray-800 text-white px-4 py-2 rounded shadow-lg text-sm z-50">
+                    {statusMessage}
+                </div>
+            )}
 
             {/* Stats Row */}
             <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
@@ -512,28 +564,82 @@ export default function CaseDetailPage(props) {
                 </div>
             </div>
 
-            {/* Modals placed at the end to avoid z-index issues mostly */}
+            {/* Staffing Modal */}
             {isStaffingModalOpen && (
                 <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
                     <div className="bg-white dark:bg-zinc-900 rounded-lg shadow-xl max-w-md w-full p-6">
                         <h2 className="text-lg font-bold mb-4">Confirm Staffing</h2>
                         <form onSubmit={handleStaffingSubmit} className="space-y-4">
-                            <input
-                                className="w-full px-3 py-2 border rounded"
-                                placeholder="Therapist Name"
-                                value={staffingFormData.therapist_name}
-                                onChange={e => setStaffingFormData({ ...staffingFormData, therapist_name: e.target.value })}
-                            />
-                            <input
-                                className="w-full px-3 py-2 border rounded"
-                                placeholder="Discipline"
-                                value={staffingFormData.discipline}
-                                onChange={e => setStaffingFormData({ ...staffingFormData, discipline: e.target.value })}
-                            />
-                            <div className="flex justify-end gap-2 text-sm">
-                                <button type="button" onClick={() => setIsStaffingModalOpen(false)} className="px-3 py-2 text-gray-600">Cancel</button>
-                                <button type="submit" disabled={isSubmitting} className="px-3 py-2 bg-indigo-600 text-white rounded">
-                                    {isSubmitting ? 'Saving...' : 'Save'}
+                            <div>
+                                <label className="block text-xs font-light text-gray-500 mb-1">Therapist Name</label>
+                                <input
+                                    className="w-full px-3 py-2 border rounded dark:bg-zinc-800 dark:border-zinc-700"
+                                    placeholder="Therapist Name"
+                                    value={staffingFormData.therapist_name}
+                                    onChange={e => setStaffingFormData({ ...staffingFormData, therapist_name: e.target.value })}
+                                />
+                            </div>
+                            <div>
+                                <label className="block text-xs font-light text-gray-500 mb-1">Discipline</label>
+                                <input
+                                    className="w-full px-3 py-2 border rounded dark:bg-zinc-800 dark:border-zinc-700"
+                                    placeholder="Discipline"
+                                    value={staffingFormData.discipline}
+                                    onChange={e => setStaffingFormData({ ...staffingFormData, discipline: e.target.value })}
+                                />
+                            </div>
+                            <div>
+                                <label className="block text-xs font-light text-gray-500 mb-1">Availability</label>
+                                <input
+                                    className="w-full px-3 py-2 border rounded dark:bg-zinc-800 dark:border-zinc-700"
+                                    placeholder="e.g. 12/22, M/W/F"
+                                    value={staffingFormData.availability}
+                                    onChange={e => setStaffingFormData({ ...staffingFormData, availability: e.target.value })}
+                                />
+                            </div>
+                            <div>
+                                <label className="block text-xs font-light text-gray-500 mb-1">Referral Source Email (for draft)</label>
+                                <input
+                                    className="w-full px-3 py-2 border rounded dark:bg-zinc-800 dark:border-zinc-700"
+                                    placeholder="email@example.com"
+                                    value={staffingFormData.referral_source_email}
+                                    onChange={e => setStaffingFormData({ ...staffingFormData, referral_source_email: e.target.value })}
+                                />
+                            </div>
+                            <div className="flex justify-end gap-2 text-sm pt-2">
+                                <button type="button" onClick={() => setIsStaffingModalOpen(false)} className="px-3 py-2 text-gray-600 hover:text-gray-800">Cancel</button>
+                                <button type="submit" disabled={isSubmitting} className="px-3 py-2 bg-indigo-600 text-white rounded hover:bg-indigo-700 disabled:opacity-50">
+                                    {isSubmitting ? 'Saving...' : 'Save & Draft Acceptance'}
+                                </button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            )}
+
+            {/* Update Status Modal */}
+            {isUpdateModalOpen && (
+                <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+                    <div className="bg-white dark:bg-zinc-900 rounded-lg shadow-xl max-w-sm w-full p-6">
+                        <h2 className="text-lg font-bold mb-4">Update Case Status</h2>
+                        <form onSubmit={handleUpdateSubmit} className="space-y-4">
+                            <div>
+                                <label className="block text-xs font-light text-gray-500 mb-1">New Status</label>
+                                <select
+                                    className="w-full px-3 py-2 border rounded dark:bg-zinc-800 dark:border-zinc-700 capitalize"
+                                    value={updateFormData.status || caseDetail.status}
+                                    onChange={e => setUpdateFormData({ ...updateFormData, status: e.target.value })}
+                                >
+                                    <option value="">Select Status</option>
+                                    {ALLOWED_STATUSES_DEFAULT.map(s => (
+                                        <option key={s} value={s}>{s}</option>
+                                    ))}
+                                </select>
+                            </div>
+                            <div className="flex justify-end gap-2 text-sm pt-2">
+                                <button type="button" onClick={() => setIsUpdateModalOpen(false)} className="px-3 py-2 text-gray-600 hover:text-gray-800">Cancel</button>
+                                <button type="submit" disabled={isSubmitting} className="px-3 py-2 bg-indigo-600 text-white rounded hover:bg-indigo-700 disabled:opacity-50">
+                                    {isSubmitting ? 'Updating...' : 'Update Status'}
                                 </button>
                             </div>
                         </form>

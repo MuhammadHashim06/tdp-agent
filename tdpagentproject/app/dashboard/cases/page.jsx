@@ -3,11 +3,14 @@
 import { useState, useEffect } from 'react';
 import Link from 'next/link';
 import { api } from '../../../lib/api';
+import { RefreshCw, Search, Filter, Hash, FileText, Activity, User, Clock, Mail } from 'lucide-react';
 
 export default function CasesListPage() {
     const [cases, setCases] = useState([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
+    const [searchQuery, setSearchQuery] = useState('');
+    const [activeTab, setActiveTab] = useState('All');
 
     useEffect(() => {
         fetchCases();
@@ -106,6 +109,41 @@ export default function CasesListPage() {
         return id ? (1000 + id).toString() : '-';
     };
 
+    const filteredCases = cases.filter(item => {
+        // Filter by Tab
+        if (activeTab !== 'All') {
+            const statusMap = {
+                'New': 'new',
+                'Pending Staffing': 'pending staffing',
+                'Staffed': 'staffed',
+                'Acceptance Drafted': 'acceptance drafted',
+                'Acceptance Sent': 'acceptance sent',
+                'Evaluation Completed': 'evaluation completed',
+                'Authorization Pending': 'authorization pending',
+                'Authorized – Treatment Started': 'authorized – treatment started',
+                'Closed': 'closed'
+            };
+
+            if (item.status !== statusMap[activeTab]) return false;
+        }
+
+        // Filter by Search
+        if (searchQuery) {
+            const query = searchQuery.toLowerCase();
+            const title = (item.title || '').toString().toLowerCase();
+            const patient = (item.metadata?.extracted?.patient_name || '').toString().toLowerCase();
+            const id = formatCaseId(item.id).toLowerCase();
+            const emailId = (item.metadata?.seed_email_id || '').toString();
+
+            return title.includes(query) ||
+                patient.includes(query) ||
+                id.includes(query) ||
+                emailId.includes(query);
+        }
+
+        return true;
+    });
+
     if (loading) {
         return (
             <div className="flex justify-center items-center h-64">
@@ -118,93 +156,158 @@ export default function CasesListPage() {
         return <div className="text-red-500 text-center p-4">{error}</div>;
     }
 
+    const tabs = [
+        'All',
+        'New',
+        'Pending Staffing',
+        'Staffed',
+        'Acceptance Drafted',
+        'Acceptance Sent',
+        'Evaluation Completed',
+        'Authorization Pending',
+        'Authorized – Treatment Started',
+        'Closed'
+    ];
+
     return (
         <div className="space-y-6">
             <div className="flex justify-between items-center">
-                <p className="text-sm text-gray-500 dark:text-gray-400">Manage and track patient case referrals.</p>
+                <div>
+                    <h1 className="text-xl font-semibold text-gray-900 dark:text-white">Cases</h1>
+                    <p className="text-sm text-gray-500 dark:text-gray-400">Manage and track patient referrals.</p>
+                </div>
                 <div className="flex gap-2">
-                    <button onClick={fetchCases} className="px-4 py-2 bg-white dark:bg-zinc-800 border border-gray-300 dark:border-zinc-700 rounded-md text-sm font-medium hover:bg-gray-50 dark:hover:bg-zinc-700">
-                        🔄 Refresh
+                    <button
+                        onClick={fetchCases}
+                        className="flex items-center gap-2 px-3 py-2 bg-white dark:bg-zinc-800 border border-gray-300 dark:border-zinc-700 rounded-lg text-sm font-medium hover:bg-gray-50 dark:hover:bg-zinc-700 transition-colors"
+                        disabled={loading}
+                    >
+                        <RefreshCw size={16} className={loading ? 'animate-spin' : ''} />
+                        Refresh
                     </button>
-                    <button className="px-4 py-2 bg-indigo-600 text-white rounded-md text-sm font-medium hover:bg-indigo-700">
-                        + New Case
-                    </button>
+                    {/* New Case button removed as requested */}
                 </div>
             </div>
 
-            <div className="bg-white dark:bg-zinc-900 shadow-md rounded-xl overflow-hidden border border-gray-100 dark:border-zinc-800/50">
-                <div className="p-4 flex gap-2">
-                    {['All', 'New', 'Staffing', 'Active', 'Closed'].map((tab) => (
-                        <button key={tab} className={`px-3 py-1 text-sm rounded-full ${tab === 'All' ? 'bg-gray-100 dark:bg-zinc-800 font-semibold' : 'text-gray-500 hover:bg-gray-50 dark:hover:bg-zinc-800'}`}>
-                            {tab}
-                        </button>
-                    ))}
-                    <div className="ml-auto flex gap-2">
-                        <input type="text" placeholder="Filter cases..." className="px-3 py-1 border border-gray-300 dark:border-zinc-700 rounded-md text-sm bg-transparent" />
+            <div className="bg-white dark:bg-zinc-900 shadow-sm rounded-xl overflow-hidden border border-gray-200 dark:border-zinc-800">
+                {/* Filters and Search Bar */}
+                {/* Filters and Search Bar */}
+                <div className="p-4 border-b border-gray-100 dark:border-zinc-800 flex flex-col gap-4">
+                    {/* Search Bar - Top */}
+                    <div className="relative w-full">
+                        <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
+                            <Search size={14} className="text-gray-400" />
+                        </div>
+                        <input
+                            type="text"
+                            placeholder="Search cases..."
+                            value={searchQuery}
+                            onChange={(e) => setSearchQuery(e.target.value)}
+                            className="block w-full pl-9 pr-3 py-2 border border-gray-300 dark:border-zinc-700 rounded-lg text-sm bg-gray-50 dark:bg-zinc-800/50 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all"
+                        />
+                    </div>
+
+                    {/* Filter Tabs - Bottom, Wrapped */}
+                    <div className="flex flex-wrap gap-2 w-full">
+                        {tabs.map((tab) => (
+                            <button
+                                key={tab}
+                                onClick={() => setActiveTab(tab)}
+                                className={`px-3 py-1.5 text-xs font-medium rounded-full transition-all border ${activeTab === tab
+                                        ? 'bg-indigo-50 border-indigo-200 text-indigo-700 dark:bg-indigo-900/30 dark:border-indigo-800 dark:text-indigo-300 shadow-sm'
+                                        : 'bg-transparent border-transparent text-gray-500 hover:bg-gray-50 hover:text-gray-700 dark:hover:bg-zinc-800 dark:text-gray-400'
+                                    }`}
+                            >
+                                {tab}
+                            </button>
+                        ))}
                     </div>
                 </div>
+
+                {/* Responsive Table Wrapper */}
                 <div className="overflow-x-auto">
                     <table className="min-w-full divide-y divide-gray-200 dark:divide-zinc-800">
-                        <thead className="bg-gray-50 dark:bg-zinc-800/50">
+                        <thead className="bg-gray-50/80 dark:bg-zinc-800/80 backend-blur-sm">
                             <tr>
-                                <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">CASE ID</th>
-                                <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">TITLE</th>
-                                <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">STATUS</th>
-                                <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">PATIENT</th>
-                                <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">DISCIPLINE</th>
-                                <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">REFERRAL SOURCE</th>
-                                <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">THERAPIST</th>
-                                <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">UPDATED</th>
-                                <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">EMAIL ID</th>
+                                <th scope="col" className="px-4 py-3 text-left text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider w-20">
+                                    <div className="flex items-center gap-1"><Hash size={12} /> ID</div>
+                                </th>
+                                <th scope="col" className="px-4 py-3 text-left text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider max-w-[200px]">
+                                    <div className="flex items-center gap-1"><FileText size={12} /> Title</div>
+                                </th>
+                                <th scope="col" className="px-4 py-3 text-left text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider w-32">
+                                    <div className="flex items-center gap-1"><Activity size={12} /> Status</div>
+                                </th>
+                                <th scope="col" className="px-4 py-3 text-left text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider max-w-[150px]">
+                                    <div className="flex items-center gap-1"><User size={12} /> Patient</div>
+                                </th>
+                                <th scope="col" className="px-4 py-3 text-left text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider w-24">
+                                    Discipline
+                                </th>
+                                <th scope="col" className="px-4 py-3 text-left text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider w-28">
+                                    <div className="flex items-center gap-1"><Clock size={12} /> Updated</div>
+                                </th>
+                                <th scope="col" className="px-4 py-3 text-left text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider w-20">
+                                    <div className="flex items-center gap-1"><Mail size={12} /> Email</div>
+                                </th>
                             </tr>
                         </thead>
                         <tbody className="bg-white dark:bg-zinc-900 divide-y divide-gray-200 dark:divide-zinc-800">
-                            {cases.map((item) => (
-                                <tr key={item.id} className="hover:bg-gray-50 dark:hover:bg-zinc-800/50 transition-colors">
-                                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
-                                        <span className="bg-gray-100 dark:bg-zinc-800 px-2 py-0.5 rounded text-xs font-mono">
-                                            {formatCaseId(item.id)}
-                                        </span>
+                            {filteredCases.map((item) => (
+                                <tr key={item.id} className="hover:bg-gray-50 dark:hover:bg-zinc-800/50 transition-colors group">
+                                    <td className="px-4 py-3 text-sm text-gray-500 dark:text-gray-400 align-top">
+                                        <span className="font-mono text-xs">{formatCaseId(item.id)}</span>
                                     </td>
-                                    <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900 dark:text-white max-w-xs truncate" title={item.title}>
-                                        <Link href={`/dashboard/cases/${item.id}`} className="hover:text-indigo-600 hover:underline">
-                                            {item.title.replace(/^RE:\s*/i, '').replace(/^\[External\]\s*/i, '')}
-                                        </Link>
+                                    <td className="px-4 py-3 text-sm font-medium text-gray-900 dark:text-white align-top max-w-[200px]">
+                                        <div className="break-words line-clamp-2" title={item.title}>
+                                            <Link href={`/dashboard/cases/${item.id}`} className="hover:text-indigo-600 dark:hover:text-indigo-400">
+                                                {item.title.replace(/^RE:\s*/i, '').replace(/^\[External\]\s*/i, '')}
+                                            </Link>
+                                        </div>
                                     </td>
-                                    <td className="px-6 py-4 whitespace-nowrap">
-                                        <span className={`px-2 py-0.5 inline-flex text-xs leading-5 font-semibold rounded-full capitalize ${getStatusColor(item.status)}`}>
+                                    <td className="px-4 py-3 align-top">
+                                        <span className={`inline-flex items-center px-2 py-1 rounded-md text-xs font-medium capitalize border ${getStatusColor(item.status)}`}>
                                             {item.status}
                                         </span>
                                     </td>
-                                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900 dark:text-white font-medium">
-                                        {item.metadata?.extracted?.patient_name || '-'}
+                                    <td className="px-4 py-3 text-sm text-gray-900 dark:text-white align-top max-w-[150px]">
+                                        <div className="break-words font-medium">
+                                            {item.metadata?.extracted?.patient_name || <span className="text-gray-400 italic">Unknown</span>}
+                                        </div>
                                     </td>
-                                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
+                                    <td className="px-4 py-3 text-sm text-gray-500 dark:text-gray-400 align-top">
                                         {item.metadata?.extracted?.discipline_requested || item.metadata?.staffing?.discipline || '-'}
                                     </td>
-                                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
-                                        {item.metadata?.extracted?.referral_source_org || '-'}
+                                    <td className="px-4 py-3 text-xs text-gray-500 dark:text-gray-400 align-top">
+                                        <div className="flex flex-col">
+                                            <span>2025-12-23</span>
+                                            <span className="text-gray-400 text-[10px]">07:37</span>
+                                        </div>
                                     </td>
-                                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
-                                        {item.metadata?.staffing?.therapist_name || '-'}
-                                    </td>
-                                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400 text-xs">
-                                        {/* Placeholder for Updated date as it's not in JSON */}
-                                        2025-12-23 <br /><span className="text-gray-400 text-[10px]">07:37</span>
-                                    </td>
-                                    <td className="px-6 py-4 whitespace-nowrap text-sm text-indigo-500 dark:text-indigo-400">
+                                    <td className="px-4 py-3 text-sm text-indigo-500 dark:text-indigo-400 align-top">
                                         #{item.metadata?.seed_email_id || '-'}
                                     </td>
                                 </tr>
                             ))}
+                            {filteredCases.length === 0 && (
+                                <tr>
+                                    <td colSpan="7" className="px-6 py-12 text-center text-gray-500 dark:text-gray-400">
+                                        <div className="flex flex-col items-center gap-2">
+                                            <Search size={32} className="text-gray-300" />
+                                            <p>No cases found matching your criteria</p>
+                                        </div>
+                                    </td>
+                                </tr>
+                            )}
                         </tbody>
                     </table>
                 </div>
-                <div className="px-6 py-3 flex justify-between items-center text-sm text-gray-500">
-                    <span>Showing {cases.length} records</span>
-                    <div className="flex gap-1">
-                        <button className="px-2 py-1 border rounded hover:bg-gray-50 disabled:opacity-50" disabled>Previous</button>
-                        <button className="px-2 py-1 border rounded hover:bg-gray-50 disabled:opacity-50" disabled>Next</button>
+
+                <div className="px-4 py-3 border-t border-gray-100 dark:border-zinc-800 flex justify-between items-center bg-gray-50/50 dark:bg-zinc-800/10">
+                    <span className="text-xs text-gray-500">Showing {filteredCases.length} records</span>
+                    <div className="flex gap-2">
+                        <button className="px-2.5 py-1.5 border border-gray-300 dark:border-zinc-700 rounded-md text-xs hover:bg-white dark:hover:bg-zinc-700 disabled:opacity-50 transition-colors" disabled>Previous</button>
+                        <button className="px-2.5 py-1.5 border border-gray-300 dark:border-zinc-700 rounded-md text-xs hover:bg-white dark:hover:bg-zinc-700 disabled:opacity-50 transition-colors" disabled>Next</button>
                     </div>
                 </div>
             </div>
