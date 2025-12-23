@@ -25,12 +25,11 @@ def create_app() -> FastAPI:
     def health():
         return {"ok": True}
 
-    app.include_router(cases_router, prefix="/cases", tags=["cases"])
-    app.include_router(drafts_router, prefix="/drafts", tags=["drafts"])
-    app.include_router(emails_router, prefix="/emails", tags=["emails"])
-    app.include_router(attachments_router, prefix="/attachments", tags=["attachments"])
-    app.include_router(notifications_router, prefix="/notifications", tags=["notifications"])
-
+    app.include_router(cases_router, prefix="/api/cases", tags=["cases"])
+    app.include_router(drafts_router, prefix="/api/drafts", tags=["drafts"])
+    app.include_router(emails_router, prefix="/api/emails", tags=["emails"])
+    app.include_router(attachments_router, prefix="/api/attachments", tags=["attachments"])
+    app.include_router(notifications_router, prefix="/api/notifications", tags=["notifications"])
     return app
 
 app = create_app()
