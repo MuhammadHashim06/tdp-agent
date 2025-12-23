@@ -1,0 +1,29 @@
+import os
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, declarative_base
+import pymysql
+from dotenv import load_dotenv
+load_dotenv()
+
+# def _db_url() -> str:
+#     host = os.getenv("DB_HOST", "127.0.0.1")
+#     port = os.getenv("DB_PORT", "3306")
+#     name = os.getenv("DB_NAME", "tdpagent")
+#     user = os.getenv("DB_USER", "root")
+#     password = os.getenv("DB_PASSWORD")
+#     if not password:
+#         raise RuntimeError("DB_PASSWORD missing")
+#     return f"mysql+pymysql://{user}:{password}@{host}:{port}/{name}?charset=utf8mb4"
+def _db_url() -> str:
+    host = "DESKTOP-9JQJ5F6\SQLEXPRESS"
+    # user = "DESKTOP-9JQJ5F6\\Muhammad Hashim"
+    user="root"
+    password = "Hashim@06"  # Use Windows Authentication, so no password needed
+    # database = "your_database_name"  # Replace with your database name
+    database = "tdpagent"
+    return f"mssql+pyodbc://{user}:{password}@{host}/{database}?driver=ODBC+Driver+17+for+SQL+Server"
+
+ENGINE = create_engine(_db_url(), pool_pre_ping=True)
+SessionLocal = sessionmaker(bind=ENGINE, autocommit=False, autoflush=False)
+
+Base = declarative_base()

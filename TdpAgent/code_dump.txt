@@ -1,0 +1,3538 @@
+
+================================================================================
+app/db.py:
+
+import os
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, declarative_base
+import pymysql
+from dotenv import load_dotenv
+load_dotenv()
+
+def _db_url() -> str:
+    host = os.getenv("DB_HOST", "127.0.0.1")
+    port = os.getenv("DB_PORT", "3306")
+    name = os.getenv("DB_NAME", "tdpagent")
+    user = os.getenv("DB_USER", "root")
+    password = os.getenv("DB_PASSWORD")
+    if not password:
+        raise RuntimeError("DB_PASSWORD missing")
+    return f"mysql+pymysql://{user}:{password}@{host}:{port}/{name}?charset=utf8mb4"
+
+ENGINE = create_engine(_db_url(), pool_pre_ping=True)
+SessionLocal = sessionmaker(bind=ENGINE, autocommit=False, autoflush=False)
+
+Base = declarative_base()
+
+
+================================================================================
+app/db_init.py:
+
+from app.db import ENGINE, Base
+from app import models  # noqa: F401
+
+def init_db() -> None:
+    Base.metadata.create_all(bind=ENGINE)
+
+if __name__ == "__main__":
+    init_db()
+    print("DB initialized.")
+
+
+================================================================================
+app/models.py:
+
+from sqlalchemy import Column, Integer, String, Text, DateTime, JSON, UniqueConstraint
+from sqlalchemy.sql import func
+from app.db import Base
+from sqlalchemy.dialects.mysql import LONGTEXT, BINARY
+from sqlalchemy.ext.mutable import MutableDict
+from datetime import datetime
+
+def utcnow():
+    # naive UTC (what MySQL DATETIME expects)
+    return datetime.utcnow()
+
+class Email(Base):
+    __tablename__ = "emails"
+    id = Column(Integer, primary_key=True)
+    mailbox = Column(String(255), nullable=True)
+    case_id = Column(Integer, nullable=True)
+
+    message_id = Column(String(1024), nullable=False)  # no longer unique
+    message_id_hash = Column(BINARY(16), nullable=False)
+    __table_args__ = (
+        UniqueConstraint("mailbox", "message_id_hash", name="uq_emails_mailbox_msg_hash"),
+    )
+
+    internet_message_id = Column(String(512))
+    subject = Column(String(500))
+    sender = Column(String(255))
+    sender_name = Column(String(255))
+
+    to_list = Column(LONGTEXT)
+    cc_list = Column(LONGTEXT)
+
+    received_datetime = Column(String(64))
+
+    body_preview = Column(LONGTEXT)
+    body_html = Column(LONGTEXT)
+
+    conversation_id = Column(String(255))
+    raw_json = Column(LONGTEXT, nullable=True)  # safest; JSON can hit size limits fast
+    received_at = Column(DateTime, nullable=True)
+
+    openai_file_id = Column(String(255), nullable=True)
+    openai_uploaded_at = Column(DateTime, nullable=True)
+
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class SyncState(Base):
+    __tablename__ = "sync_state"
+    id = Column(Integer, primary_key=True)
+    mailbox = Column(String(255), nullable=False, unique=True)
+    delta_link = Column(LONGTEXT)
+    last_sync_iso = Column(String(64))
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+class Case(Base):
+    __tablename__ = "cases"
+    id = Column(Integer, primary_key=True)
+    external_id = Column(String(512), unique=True)
+    title = Column(String(500), nullable=False)
+    status = Column(String(50), nullable=False, default="new")
+    metadata_json = Column(MutableDict.as_mutable(JSON), nullable=True)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow, nullable=False)
+
+class Draft(Base):
+    __tablename__ = "drafts"
+    id = Column(Integer, primary_key=True)
+    email_id = Column(Integer, nullable=False)  # store Email.id
+    draft = Column(LONGTEXT, nullable=False)
+    model = Column(String(100), nullable=False)
+    tone = Column(String(50))
+    status = Column(String(32), nullable=False, default="draft")
+    mailbox = Column(String(255), nullable=True)
+    sent_message_id = Column(String(1024), nullable=True)
+    sent_at = Column(DateTime, nullable=True)
+
+    graph_draft_message_id = Column(String(1024), nullable=True)  # NEW
+    graph_draft_web_link = Column(String(1024), nullable=True)    # NEW
+
+    created_at = Column(DateTime, server_default=func.now())
+
+class EmailAttachment(Base):
+    __tablename__ = "email_attachments"
+
+    id = Column(Integer, primary_key=True)
+    email_id = Column(Integer, nullable=False)
+
+    attachment_id = Column(String(255), nullable=False)  # Graph attachment id
+    name = Column(String(512))
+    content_type = Column(String(255))
+    size = Column(Integer)
+
+    is_inline = Column(Integer, default=0)
+    content_id = Column(String(255), nullable=True)
+
+    local_path = Column(String(1024), nullable=True)
+
+    created_at = Column(DateTime, server_default=func.now())
+
+    openai_file_id = Column(String(255), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("email_id", "attachment_id", name="uq_email_attachment"),
+    )
+
+class CaseEvent(Base):
+    __tablename__ = "case_events"
+
+    id = Column(Integer, primary_key=True)
+    case_id = Column(Integer, nullable=False)
+    email_id = Column(Integer, nullable=True)
+
+    event_type = Column(String(64), nullable=False)     # e.g. referral_received
+    actor = Column(String(16), nullable=False, default="ai")  # ai|human
+
+    payload_json = Column(MutableDict.as_mutable(JSON), nullable=True)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("case_id", "email_id", "event_type", name="uq_case_event_once"),
+    )
+
+
+================================================================================
+app/mysql_ops.py:
+
+from __future__ import annotations
+from typing import Optional, Dict, Any, List
+
+import hashlib
+from sqlalchemy import select
+
+from app.db import SessionLocal
+from app.models import Email, SyncState, Case, Draft, EmailAttachment, CaseEvent
+
+import json
+from datetime import datetime, timezone
+
+def _message_id_hash(message_id: str) -> bytes:
+    """
+    Returns 16-byte MD5 hash for message_id
+    Matches MySQL BINARY(16)
+    """
+    return hashlib.md5(message_id.encode("utf-8")).digest()
+
+def _clean_subject_for_case(subject: str | None) -> str:
+    s = (subject or "").strip()
+    if not s:
+        return "No subject"
+    return s[:500]
+
+class MysqlOps:
+    # ---------- Sync State ----------
+    def get_sync_state(self, mailbox: str) -> Optional[SyncState]:
+        with SessionLocal() as db:
+            return db.scalar(
+                select(SyncState).where(SyncState.mailbox == mailbox)
+            )
+
+    def upsert_sync_state(
+        self,
+        mailbox: str,
+        delta_link: Optional[str],
+        last_sync_iso: Optional[str],
+    ) -> None:
+        with SessionLocal() as db:
+            row = db.scalar(
+                select(SyncState).where(SyncState.mailbox == mailbox)
+            )
+            if row:
+                row.delta_link = delta_link
+                row.last_sync_iso = last_sync_iso
+            else:
+                row = SyncState(
+                    mailbox=mailbox,
+                    delta_link=delta_link,
+                    last_sync_iso=last_sync_iso,
+                )
+                db.add(row)
+            db.commit()
+
+    # ---------- Emails ----------
+    def upsert_email(self, e: Dict[str, Any]) -> int:
+        """
+        Insert if new; update if message_id_hash already exists.
+        Returns Email.id
+        """
+        import json
+
+        message_id = e["message_id"]
+        if not message_id:
+            raise ValueError("Missing message_id")
+        msg_hash = _message_id_hash(message_id)
+
+        # ALWAYS coerce raw payload to string
+        raw = e.get("raw")
+        raw_str = json.dumps(raw, ensure_ascii=False, default=str) if isinstance(raw, (dict, list)) else raw
+
+        with SessionLocal() as db:
+            row = db.scalar(
+                select(Email)
+                .where(Email.mailbox == e.get("mailbox"))
+                .where(Email.message_id_hash == msg_hash)
+            )
+
+            if row:
+                row.mailbox = e.get("mailbox")
+                row.case_id = e.get("case_id")
+                row.message_id = message_id
+                row.message_id_hash = msg_hash
+                row.internet_message_id = e.get("internet_message_id")
+                row.subject = e.get("subject")
+                row.sender = e.get("sender")
+                row.sender_name = e.get("sender_name")
+                row.to_list = ",".join(e.get("to") or [])
+                row.cc_list = ",".join(e.get("cc") or [])
+                row.received_datetime = e.get("received_datetime")
+                row.body_preview = e.get("body_preview")
+                row.body_html = e.get("body_html")
+                row.conversation_id = e.get("conversation_id")
+                row.raw_json = raw_str
+                db.commit()
+                return row.id
+
+            row = Email(
+                mailbox=e.get("mailbox"),
+                case_id=e.get("case_id"),
+                message_id=message_id,
+                message_id_hash=msg_hash,
+                internet_message_id=e.get("internet_message_id"),
+                subject=e.get("subject"),
+                sender=e.get("sender"),
+                sender_name=e.get("sender_name"),
+                to_list=",".join(e.get("to") or []),
+                cc_list=",".join(e.get("cc") or []),
+                received_datetime=e.get("received_datetime"),
+                body_preview=e.get("body_preview"),
+                body_html=e.get("body_html"),
+                conversation_id=e.get("conversation_id"),
+                raw_json=raw_str,
+            )
+            db.add(row)
+            db.commit()
+            db.refresh(row)
+            return row.id
+
+    def upsert_email_attachment(self, email_id: int, a: Dict[str, Any], local_path: str | None) -> None:
+        with SessionLocal() as db:
+            row = db.scalar(
+                select(EmailAttachment)
+                .where(EmailAttachment.email_id == email_id)
+                .where(EmailAttachment.attachment_id == a.get("id"))
+            )
+
+            if row:
+                # Update details (especially local_path) if we learned more
+                row.name = row.name or a.get("name")
+                row.content_type = row.content_type or (a.get("contentType") or a.get("content_type"))
+                row.size = row.size or a.get("size")
+                row.is_inline = 1 if a.get("isInline") else (row.is_inline or 0)
+                row.content_id = row.content_id or a.get("contentId")
+
+                if local_path and not row.local_path:
+                    row.local_path = local_path
+
+                db.commit()
+                return
+
+            row = EmailAttachment(
+                email_id=email_id,
+                attachment_id=a.get("id"),
+                name=a.get("name"),
+                content_type=a.get("contentType") or a.get("content_type"),
+                size=a.get("size"),
+                is_inline=1 if a.get("isInline") else 0,
+                content_id=a.get("contentId"),
+                local_path=local_path,
+            )
+            db.add(row)
+            db.commit()
+
+    def get_email_by_id(self, email_id: int) -> Optional[Email]:
+        with SessionLocal() as db:
+            return db.get(Email, email_id)
+
+    def list_emails(self, limit: int = 50) -> List[Email]:
+        with SessionLocal() as db:
+            return list(
+                db.scalars(
+                    select(Email)
+                    .order_by(Email.id.desc())
+                    .limit(limit)
+                )
+            )
+
+    # ---------- Drafts ----------
+    def create_draft(
+            self,
+            email_id: int,
+            draft: str,
+            model: str,
+            tone: Optional[str] = None,
+            mailbox: Optional[str] = None,
+            graph_draft_message_id: Optional[str] = None,
+            graph_draft_web_link: Optional[str] = None,
+    ) -> int:
+        with SessionLocal() as db:
+            row = Draft(
+                email_id=email_id,
+                draft=draft,
+                model=model,
+                tone=tone,
+                mailbox=mailbox,
+                graph_draft_message_id=graph_draft_message_id,
+                graph_draft_web_link=graph_draft_web_link,
+            )
+            db.add(row)
+            db.commit()
+            db.refresh(row)
+            return row.id
+
+    # ---------- Cases ----------
+    def list_cases(self) -> List[Case]:
+        with SessionLocal() as db:
+            return list(
+                db.scalars(
+                    select(Case).order_by(Case.id.desc())
+                )
+            )
+
+    def create_case(
+        self,
+        external_id: Optional[str],
+        title: str,
+        status: str,
+        metadata: Optional[Dict[str, Any]],
+    ) -> int:
+        with SessionLocal() as db:
+            row = Case(
+                external_id=external_id,
+                title=title,
+                status=status,
+                metadata_json=metadata or {},
+            )
+            db.add(row)
+            db.commit()
+            db.refresh(row)
+            return row.id
+
+    def update_case(self, case_id: int, fields: Dict[str, Any]) -> None:
+        with SessionLocal() as db:
+            row = db.get(Case, case_id)
+            if not row:
+                raise ValueError("Case not found")
+            for k, v in fields.items():
+                setattr(row, k, v)
+            db.commit()
+
+    def get_draft_by_id(self, draft_id: int) -> Optional[Draft]:
+        with SessionLocal() as db:
+            return db.get(Draft, draft_id)
+
+    def list_drafts_for_email(self, email_id: int, limit: int = 20) -> List[Draft]:
+        with SessionLocal() as db:
+            return list(
+                db.scalars(
+                    select(Draft)
+                    .where(Draft.email_id == email_id)
+                    .order_by(Draft.id.desc())
+                    .limit(limit)
+                )
+            )
+
+    def get_latest_draft_for_email(self, email_id: int) -> Optional[Draft]:
+        with SessionLocal() as db:
+            return db.scalar(
+                select(Draft)
+                .where(Draft.email_id == email_id)
+                .order_by(Draft.id.desc())
+                .limit(1)
+            )
+
+    def mark_draft_sent(self, draft_id: int, mailbox: str, sent_message_id: Optional[str] = None) -> None:
+        with SessionLocal() as db:
+            row = db.get(Draft, draft_id)
+            if not row:
+                raise ValueError("Draft not found")
+            row.status = "sent"
+            row.mailbox = mailbox
+            row.sent_message_id = sent_message_id
+            row.sent_at = datetime.now(timezone.utc)
+            db.commit()
+
+    def list_emails_for_case(self, case_id: int, limit: int = 200) -> List[Email]:
+        with SessionLocal() as db:
+            return list(
+                db.scalars(
+                    select(Email)
+                    .where(Email.case_id == case_id)
+                    .order_by(Email.received_datetime.asc())
+                    .limit(limit)
+                )
+            )
+
+    def get_case_id_by_conversation(self, mailbox: str, conversation_id: str) -> Optional[int]:
+        if not conversation_id:
+            return None
+        with SessionLocal() as db:
+            row = db.scalar(
+                select(Email.case_id)
+                .where(Email.mailbox == mailbox)
+                .where(Email.conversation_id == conversation_id)
+                .where(Email.case_id.isnot(None))
+                .order_by(Email.id.asc())
+                .limit(1)
+            )
+            return int(row) if row else None
+
+    def get_or_create_case_for_email(self, email: Dict[str, Any], mailbox: str, email_id: int) -> int:
+        conv_id = (email.get("conversation_id") or "").strip()
+
+        # 1) try existing case for this conversation in this mailbox
+        existing_case_id = self.get_case_id_by_conversation(mailbox, conv_id) if conv_id else None
+        if existing_case_id:
+            return existing_case_id
+
+        # 2) create new case
+        title = _clean_subject_for_case(email.get("subject"))
+        external_id = email.get("message_id")  # ok as a starter (or conversation_id if you prefer)
+
+        with SessionLocal() as db:
+            row = Case(
+                external_id=external_id,
+                title=title,
+                status="new",
+                metadata_json={
+                    "mailbox": mailbox,
+                    "conversation_id": conv_id,
+                    "seed_email_id": email_id,
+                },
+            )
+            db.add(row)
+            db.commit()
+            db.refresh(row)
+            return row.id
+
+    def list_attachments_for_email(self, email_id: int) -> List[EmailAttachment]:
+        with SessionLocal() as db:
+            return list(
+                db.scalars(
+                    select(EmailAttachment)
+                    .where(EmailAttachment.email_id == email_id)
+                    .order_by(EmailAttachment.id.asc())
+                )
+            )
+
+    def set_email_case_id(self, email_id: int, case_id: int) -> None:
+        with SessionLocal() as db:
+            row = db.get(Email, email_id)
+            if not row:
+                raise ValueError("Email not found")
+            row.case_id = case_id
+            db.commit()
+
+    def get_or_create_case_by_external_id(self, external_id: str, title: str, metadata: dict | None = None) -> int:
+        if not external_id:
+            raise ValueError("external_id is required")
+
+        with SessionLocal() as db:
+            row = db.scalar(select(Case).where(Case.external_id == external_id))
+            if row:
+                # Keep title stable unless current one is empty
+                if (not row.title) and title:
+                    row.title = _clean_subject_for_case(title)
+                    db.commit()
+                return row.id
+
+            row = Case(
+                external_id=external_id,
+                title=_clean_subject_for_case(title),
+                status="new",
+                metadata_json=metadata or {},
+            )
+            db.add(row)
+            db.commit()
+            db.refresh(row)
+            return row.id
+
+    def create_case_event(
+            self,
+            case_id: int,
+            event_type: str,
+            email_id: int | None = None,
+            actor: str = "ai",
+            payload: dict | None = None,
+    ) -> int:
+        from app.models import CaseEvent
+        from datetime import datetime, timezone
+
+        with SessionLocal() as db:
+            row = CaseEvent(
+                case_id=case_id,
+                email_id=email_id,
+                event_type=event_type,
+                actor=actor,
+                payload_json=payload or {},
+                created_at=datetime.now(timezone.utc),  # FORCE IT
+            )
+            db.add(row)
+            db.commit()
+            db.refresh(row)
+            return row.id
+
+    def set_email_received_at(self, email_id: int, received_at) -> None:
+        with SessionLocal() as db:
+            row = db.get(Email, email_id)
+            if not row:
+                return
+            row.received_at = received_at
+            db.commit()
+
+    def case_event_exists(self, case_id: int, email_id: int, event_type: str) -> bool:
+        from app.models import CaseEvent
+        with SessionLocal() as db:
+            row = db.scalar(
+                select(CaseEvent.id)
+                .where(CaseEvent.case_id == case_id)
+                .where(CaseEvent.email_id == email_id)
+                .where(CaseEvent.event_type == event_type)
+                .limit(1)
+            )
+            return bool(row)
+
+    def get_case_by_id(self, case_id: int) -> Optional[Case]:
+        with SessionLocal() as db:
+            return db.get(Case, case_id)
+
+    def get_latest_email_for_case(self, case_id: int) -> Optional[Email]:
+        with SessionLocal() as db:
+            return db.scalar(
+                select(Email)
+                .where(Email.case_id == case_id)
+                .order_by(Email.id.desc())
+                .limit(1)
+            )
+
+    def get_latest_stall_event(self, case_id: int, stall_type: str):
+        from app.models import CaseEvent
+        from sqlalchemy import select
+        import json
+
+        with SessionLocal() as db:
+            # If payload_json is JSON column in MySQL, you can use JSON_EXTRACT for proper filtering.
+            # If it's stored as dict (SQLAlchemy JSON), simplest is fetch latest few and filter in Python.
+            rows = list(
+                db.scalars(
+                    select(CaseEvent)
+                    .where(CaseEvent.case_id == case_id)
+                    .where(CaseEvent.event_type == "stall_detected")
+                    .order_by(CaseEvent.created_at.desc())
+                    .limit(25)
+                )
+            )
+
+            for r in rows:
+                p = r.payload_json
+                if isinstance(p, str):
+                    try:
+                        p = json.loads(p)
+                    except Exception:
+                        p = {}
+                if (p or {}).get("stall_type") == stall_type:
+                    return r
+            return None
+
+    def get_latest_case_event(self, case_id: int, event_type: str) -> Optional[CaseEvent]:
+        with SessionLocal() as db:
+            return db.scalar(
+                select(CaseEvent)
+                .where(CaseEvent.case_id == case_id)
+                .where(CaseEvent.event_type == event_type)
+                .order_by(CaseEvent.created_at.desc())
+                .limit(1)
+            )
+
+    def list_active_cases(self, limit: int = 500) -> List[Case]:
+        with SessionLocal() as db:
+            return list(
+                db.scalars(
+                    select(Case)
+                    .where(Case.status != "closed")
+                    .order_by(Case.updated_at.desc())
+                    .limit(limit)
+                )
+            )
+
+    def get_latest_meaningful_event(self, case_id: int) -> Optional[CaseEvent]:
+        ignore = {"llm_processed", "stall_detected", "followup_draft_created"}
+        with SessionLocal() as db:
+            return db.scalar(
+                select(CaseEvent)
+                .where(CaseEvent.case_id == case_id)
+                .where(CaseEvent.event_type.notin_(ignore))
+                .order_by(CaseEvent.created_at.desc())
+                .limit(1)
+            )
+
+    def case_event_exists_any(self, case_id: int, email_id: int | None, event_type: str) -> bool:
+        """
+        Handles email_id None properly (MySQL UNIQUE allows multiple NULLs, so we must guard in code).
+        """
+        with SessionLocal() as db:
+            q = select(CaseEvent.id).where(
+                CaseEvent.case_id == case_id,
+                CaseEvent.event_type == event_type,
+            )
+
+            if email_id is None:
+                q = q.where(CaseEvent.email_id.is_(None))
+            else:
+                q = q.where(CaseEvent.email_id == email_id)
+
+            row = db.scalar(q.limit(1))
+            return bool(row)
+
+    def merge_case_metadata(self, case_id: int, patch: dict) -> None:
+        """
+        Merge patch into metadata_json (shallow merge).
+        """
+        with SessionLocal() as db:
+            row = db.get(Case, case_id)
+            if not row:
+                raise ValueError("Case not found")
+
+            base = row.metadata_json or {}
+
+            if isinstance(base, str):
+                try:
+                    base = json.loads(base)
+                except Exception:
+                    base = {}
+
+            if not isinstance(base, dict):
+                base = {}
+
+            if isinstance(patch, str):
+                try:
+                    patch = json.loads(patch)
+                except Exception:
+                    patch = {}
+
+            if not isinstance(patch, dict):
+                patch = {}
+
+            base.update(patch)
+            row.metadata_json = base
+            db.commit()
+
+    def set_attachment_openai_file_id(self, attachment_row_id: int, openai_file_id: str) -> None:
+        with SessionLocal() as db:
+            row = db.get(EmailAttachment, attachment_row_id)
+            if not row:
+                return
+            row.openai_file_id = openai_file_id
+            db.commit()
+
+    def get_attachments_for_email_full(self, email_id: int) -> List[EmailAttachment]:
+        with SessionLocal() as db:
+            return list(
+                db.scalars(
+                    select(EmailAttachment)
+                    .where(EmailAttachment.email_id == email_id)
+                    .order_by(EmailAttachment.id.asc())
+                )
+            )
+
+
+================================================================================
+app/ai\client.py:
+
+from __future__ import annotations
+import os
+from openai import OpenAI
+from dotenv import load_dotenv
+
+# Load .env once when this module is imported
+load_dotenv()
+
+def get_openai_client() -> OpenAI:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is missing in .env")
+    return OpenAI(api_key=api_key)
+
+
+================================================================================
+app/ai\prompts.py:
+
+# app/ai/prompts.py
+
+SYSTEM_DRAFT = """You are an assistant that drafts concise, compliant, professional email replies.
+Rules:
+- Use plain English.
+- Do not invent facts.
+- If missing info, ask 1-3 clear questions.
+- Keep it brief unless the user requests detail.
+"""
+
+def user_prompt_for_draft(subject: str, sender: str, body_text: str, tone: str, instructions: str | None) -> str:
+    extra = f"\nExtra instructions: {instructions}" if instructions else ""
+    return f"""Draft a reply.
+
+Subject: {subject}
+From: {sender}
+Tone: {tone}
+
+Email body:
+{body_text}
+{extra}
+"""
+
+
+SYSTEM_ACCEPTANCE = """You draft concise, compliant, professional case acceptance emails.
+
+Hard rules:
+- Do not invent facts. Do not use placeholders like [Your Name], [Phone], etc.
+- If therapist_name is missing, do NOT claim a therapist is assigned.
+- If referral_source_email is missing, ask for the best contact email.
+- Keep it short and operational.
+"""
+
+def user_prompt_for_acceptance(
+    case_title: str,
+    referral_source_email: str | None,
+    therapist_name: str | None,
+    discipline: str | None,
+    availability: str | None,
+) -> str:
+    return f"""Draft a case acceptance email to the referral source.
+
+Case title/patient identifier: {case_title}
+
+Known details:
+- Referral source email: {referral_source_email or "MISSING"}
+- Therapist name: {therapist_name or "MISSING"}
+- Discipline: {discipline or "MISSING"}
+- Availability: {availability or "MISSING"}
+
+Requirements:
+- Confirm the case has been accepted.
+- Evaluation: say the initial evaluation is pending and will be scheduled.
+- Therapist assignment:
+  - If therapist_name is provided: state the assigned therapist name (and discipline if provided).
+  - If therapist_name is NOT provided: say staffing is in progress.
+- If referral source email is MISSING: ask for the best contact email.
+- Do not mention internal systems.
+- Do not include any signature placeholders.
+"""
+
+
+# --------------------------------------------------------------------------------------
+# NEW: Unified email processing (classification + extraction) with attachments "as-is"
+# --------------------------------------------------------------------------------------
+
+SYSTEM_EMAIL_PROCESSOR = """You process inbound operational healthcare emails for case coordination.
+
+Hard rules:
+- Output MUST be valid JSON only. No commentary.
+- Choose intent ONLY from allowed_intents.
+- Do not invent facts. If a value is missing, return null.
+- Do not infer clinical facts beyond what's explicitly stated.
+- If ambiguous, set intent to "unknown" with low confidence.
+- Use mailbox + subject + body + attachments to decide.
+"""
+
+def user_prompt_for_email_processing(
+    mailbox: str,
+    subject: str,
+    sender: str,
+    body_text: str,
+    allowed_intents: list[str],
+    allowed_statuses: list[str],
+) -> str:
+    return f"""Process this email.
+
+Allowed intents:
+{allowed_intents}
+
+Allowed statuses:
+{allowed_statuses}
+
+Mailbox: {mailbox}
+From: {sender}
+Subject: {subject}
+
+Body:
+{body_text}
+
+Return JSON with exactly:
+- intent: one of allowed_intents
+- confidence: number from 0 to 1
+- signals: array of short strings (0-5 items)
+- extracted: object (keys/values you found) OR null
+- recommended_status: one of allowed_statuses OR null
+"""
+
+
+# --------------------------------------------------------------------------------------
+# Legacy prompts kept for backward compatibility (older flow)
+# --------------------------------------------------------------------------------------
+
+SYSTEM_REFERRAL_EXTRACT = """You extract structured referral data from an email + extracted attachment text.
+
+Hard rules:
+- Do not invent facts. If missing, return null.
+- Prefer exact values as written.
+- Do not guess patient details.
+- If multiple patients/cases exist, return the primary one (or the first clearly identified).
+- Output must be valid JSON and follow the schema strictly.
+"""
+
+def user_prompt_for_referral_extract(
+    subject: str,
+    sender: str,
+    body_text: str,
+    attachments: list[dict] | None,
+    attachments_text: str | None,
+) -> str:
+    att_lines = []
+    for a in attachments or []:
+        name = (a.get("name") or "").strip()
+        ct = (a.get("content_type") or "").strip()
+        size = a.get("size")
+        lp = (a.get("local_path") or "").strip()
+        if name or ct or lp:
+            att_lines.append(f"- {name} | {ct} | {size} | {lp}")
+
+    att_block = "\n".join(att_lines) if att_lines else "(none)"
+    att_text_block = (attachments_text or "").strip() or "(none)"
+
+    return f"""Extract referral details from this email.
+
+Subject: {subject}
+From: {sender}
+
+Email body (cleaned):
+{body_text}
+
+Attachments (metadata):
+{att_block}
+
+Attachments text (extracted locally; may be partial):
+{att_text_block}
+
+Return fields as JSON (no commentary)."""
+
+
+SYSTEM_INTENT_CLASSIFIER = """You classify a single inbound email into one of the allowed intents.
+
+Hard rules:
+- Choose ONLY from allowed_intents.
+- Do not invent new labels.
+- Do not infer clinical facts.
+- Use mailbox + subject + body + attachment metadata/text to decide.
+- If ambiguous, return "unknown".
+- Output MUST be valid JSON only (no commentary).
+"""
+
+def user_prompt_for_intent_classification(
+    mailbox: str,
+    subject: str | None,
+    sender: str | None,
+    body_text: str,
+    allowed_intents: list[str],
+    attachments: list[dict] | None,
+    attachments_text: str | None,
+) -> str:
+    att_lines = []
+    for a in attachments or []:
+        name = (a.get("name") or "").strip()
+        ct = (a.get("content_type") or a.get("contentType") or "").strip()
+        size = a.get("size")
+        lp = (a.get("local_path") or "").strip()
+        if name or ct or lp:
+            att_lines.append(f"- {name} | {ct} | {size} | {lp}")
+    att_block = "\n".join(att_lines) if att_lines else "(none)"
+    att_text_block = (attachments_text or "").strip() or "(none)"
+
+    return f"""Classify this email into one intent.
+
+Allowed intents:
+{allowed_intents}
+
+Mailbox: {mailbox}
+From: {sender or ""}
+Subject: {subject or ""}
+
+Body (cleaned):
+{body_text}
+
+Attachments (metadata):
+{att_block}
+
+Attachments text (extracted locally; may be partial):
+{att_text_block}
+
+Return JSON with exactly:
+- intent: one of allowed_intents
+- confidence: number from 0 to 1
+- signals: array of short strings (0-5 items) explaining why
+"""
+
+
+================================================================================
+app/ai\schemas.py:
+
+from pydantic import BaseModel, Field
+from typing import Optional, List, Dict, Any, Literal
+
+class IntentClassifyOut(BaseModel):
+    intent: str
+    confidence: float = Field(ge=0, le=1)
+    signals: List[str] = Field(default_factory=list)
+
+class DraftLLMOut(BaseModel):
+    draft: str
+    notes: Optional[str] = None
+
+class ReferralExtractOut(BaseModel):
+    # core requirements
+    patient_name: Optional[str] = None
+    dob: Optional[str] = None  # keep as string; normalize later (YYYY-MM-DD) if desired
+    diagnosis: Optional[str] = None
+    address: Optional[str] = None
+    insurance: Optional[str] = None
+    discipline_requested: Optional[str] = None
+
+    referral_source_name: Optional[str] = None
+    referral_source_org: Optional[str] = None
+    referral_source_email: Optional[str] = None
+    referral_source_phone: Optional[str] = None
+    referral_source_fax: Optional[str] = None
+
+    # additional useful fields
+    patient_id: Optional[str] = None
+    mrn: Optional[str] = None
+    ordering_provider: Optional[str] = None
+    requested_start_date: Optional[str] = None
+    visit_frequency: Optional[str] = None
+    authorization_required: Optional[str] = Field(default=None, description="yes|no|unknown")
+    language: Optional[str] = None
+    caregiver_contact: Optional[str] = None
+    special_instructions: Optional[str] = None
+
+    # traceability
+    extracted_from: Optional[str] = Field(default="email_body", description="email_body|attachments_names|mixed")
+    confidence_notes: Optional[str] = None
+
+    # if you want to keep raw snippets used for extraction
+    evidence: Optional[Dict[str, Any]] = None
+
+
+================================================================================
+app/ai\tasks.py:
+
+# app/ai/tasks.py  (FIXED ImportError + draft_case_acceptance implemented)
+from __future__ import annotations
+
+import os
+import json
+from dotenv import load_dotenv
+
+from app.ai.client import get_openai_client
+from app.ai.prompts import (
+    SYSTEM_DRAFT,
+    user_prompt_for_draft,
+    SYSTEM_ACCEPTANCE,
+    user_prompt_for_acceptance,
+    SYSTEM_REFERRAL_EXTRACT,
+    user_prompt_for_referral_extract,
+    SYSTEM_INTENT_CLASSIFIER,
+    user_prompt_for_intent_classification,
+    SYSTEM_EMAIL_PROCESSOR,
+    user_prompt_for_email_processing,
+)
+from app.core.sanitize import strip_html, safe_text
+from app.ai.schemas import ReferralExtractOut, IntentClassifyOut
+
+load_dotenv()
+
+ALLOWED_INTENTS_DEFAULT = [
+    "referral_received",
+    "evaluation_received",
+    "authorization_approved",
+    "authorization_request",
+    "staffing_confirmation",
+    "non_case_email",
+    "unknown",
+]
+
+ALLOWED_STATUSES_DEFAULT = [
+    "new",
+    "pending staffing",
+    "staffed",
+    "acceptance drafted",
+    "acceptance sent",
+    "evaluation completed",
+    "authorization pending",
+    "authorized – treatment started",
+    "closed",
+]
+
+
+def _coerce_body_text(body_html: str | None, body_preview: str | None) -> str:
+    body_text = body_preview or ""
+    if body_html:
+        body_text = strip_html(body_html) or body_text
+    return safe_text(body_text, 12000)
+
+
+def _response_text(resp) -> str:
+    txt = getattr(resp, "output_text", None)
+    if isinstance(txt, str) and txt.strip():
+        return txt.strip()
+
+    out = getattr(resp, "output", None)
+    if isinstance(out, list):
+        parts = []
+        for item in out:
+            content = item.get("content") if isinstance(item, dict) else getattr(item, "content", None)
+            if isinstance(content, list):
+                for c in content:
+                    t = c.get("text") if isinstance(c, dict) else getattr(c, "text", None)
+                    if t:
+                        parts.append(t)
+        return "\n".join(parts).strip()
+
+    return ""
+
+
+# --------------------------------------------------------------------------------------
+# Attachments → OpenAI (as-is)
+# --------------------------------------------------------------------------------------
+
+def _upload_openai_file(local_path: str) -> str:
+    client = get_openai_client()
+    purpose = (os.getenv("OPENAI_FILE_PURPOSE", "user_data") or "user_data").strip()
+    with open(local_path, "rb") as f:
+        up = client.files.create(file=f, purpose=purpose)
+    return up.id
+
+
+def _responses_create_json(client, *, model: str, system_text: str, user_text: str, file_ids: list[str]):
+    base = {
+        "model": model,
+        "input": [
+            {"role": "system", "content": [{"type": "input_text", "text": system_text}]},
+            {
+                "role": "user",
+                "content": (
+                    [{"type": "input_text", "text": user_text}]
+                    + [{"type": "input_file", "file_id": fid} for fid in (file_ids or [])]
+                ),
+            },
+        ],
+    }
+
+    try:
+        return client.responses.create(
+            **base,
+            text={"format": {"type": "json_object"}},
+        )
+    except TypeError:
+        return client.responses.create(**base)
+
+
+def _responses_create_text(client, *, model: str, system_text: str, user_text: str, file_ids: list[str] | None = None):
+    base = {
+        "model": model,
+        "input": [
+            {"role": "system", "content": [{"type": "input_text", "text": system_text}]},
+            {
+                "role": "user",
+                "content": (
+                    [{"type": "input_text", "text": user_text}]
+                    + [{"type": "input_file", "file_id": fid} for fid in (file_ids or [])]
+                ),
+            },
+        ],
+    }
+    return client.responses.create(**base)
+
+
+def process_email_llm(
+    *,
+    mailbox: str,
+    subject: str | None,
+    sender: str | None,
+    body_html: str | None,
+    body_preview: str | None,
+    attachments: list[dict] | None,
+    allowed_intents: list[str] | None = None,
+    allowed_statuses: list[str] | None = None,
+) -> tuple[dict, str]:
+
+    allowed_i = allowed_intents or ALLOWED_INTENTS_DEFAULT
+    allowed_s = allowed_statuses or ALLOWED_STATUSES_DEFAULT
+
+    body_text = safe_text(_coerce_body_text(body_html, body_preview), 12000)
+    subject_s = safe_text(subject or "", 300)
+    sender_s = safe_text(sender or "", 300)
+    mailbox_s = safe_text(mailbox or "", 200)
+
+    file_ids: list[str] = []
+    upload_failures: list[str] = []
+
+    try:
+        from app.mysql_ops import MysqlOps
+        ops = MysqlOps()
+    except Exception:
+        ops = None
+
+    for a in attachments or []:
+        try:
+            local_path = (a.get("local_path") or "").strip()
+            if not local_path:
+                continue
+
+            cached = (a.get("openai_file_id") or "").strip()
+            if cached:
+                file_ids.append(cached)
+                continue
+
+            fid = _upload_openai_file(local_path)
+            file_ids.append(fid)
+
+            if ops and a.get("id"):
+                try:
+                    ops.set_attachment_openai_file_id(int(a["id"]), fid)
+                except Exception:
+                    pass
+
+        except Exception as e:
+            upload_failures.append(f"id={a.get('id')} err={type(e).__name__}")
+
+    client = get_openai_client()
+    model = os.getenv("OPENAI_MODEL", "gpt-5-nano")
+
+    prompt = user_prompt_for_email_processing(
+        mailbox=mailbox_s,
+        subject=subject_s,
+        sender=sender_s,
+        body_text=body_text,
+        allowed_intents=allowed_i,
+        allowed_statuses=allowed_s,
+    )
+
+    resp = _responses_create_json(
+        client,
+        model=model,
+        system_text=SYSTEM_EMAIL_PROCESSOR,
+        user_text=prompt,
+        file_ids=file_ids,
+    )
+
+    raw = _response_text(resp)
+
+    try:
+        out = json.loads(raw)
+    except Exception:
+        out = {
+            "intent": "unknown",
+            "confidence": 0.0,
+            "signals": ["json_parse_failed"],
+            "extracted": None,
+            "recommended_status": None,
+        }
+
+    if file_ids:
+        out["signals"] = (out.get("signals") or []) + ["files_attached"]
+
+    if upload_failures:
+        out["signals"] = (out.get("signals") or []) + ["attachment_upload_failed"]
+        out["attachment_upload_failures"] = upload_failures[:5]
+
+    if out.get("intent") not in allowed_i:
+        out["intent"] = "unknown"
+        out["confidence"] = 0.0
+        out["signals"] = (out.get("signals") or []) + ["intent_not_allowed"]
+
+    if out.get("recommended_status") not in allowed_s:
+        out["recommended_status"] = None
+
+    out.setdefault("confidence", 0.0)
+    out.setdefault("signals", [])
+    out.setdefault("extracted", None)
+    out.setdefault("recommended_status", None)
+
+    return out, model
+
+
+# --------------------------------------------------------------------------------------
+# FIX: add draft_case_acceptance for API import (cases.py)
+# Uses Responses API (no temperature, no response_format kwargs)
+# --------------------------------------------------------------------------------------
+
+def draft_case_acceptance(
+    *,
+    case_title: str,
+    referral_source_email: str | None,
+    therapist_name: str | None,
+    discipline: str | None,
+    availability: str | None,
+) -> tuple[str, str]:
+    client = get_openai_client()
+    model = os.getenv("OPENAI_MODEL", "gpt-5-nano")
+
+    prompt = user_prompt_for_acceptance(
+        case_title=safe_text(case_title or "", 400),
+        referral_source_email=safe_text(referral_source_email or "", 300),
+        therapist_name=safe_text(therapist_name or "", 200),
+        discipline=safe_text(discipline or "", 200),
+        availability=safe_text(availability or "", 400),
+    )
+
+    resp = _responses_create_text(
+        client,
+        model=model,
+        system_text=SYSTEM_ACCEPTANCE,
+        user_text=prompt,
+        file_ids=[],
+    )
+
+    draft_text = _response_text(resp).strip()
+    if not draft_text:
+        draft_text = "Thank you. We can accept the case. Please confirm the next steps and scheduling details."
+
+    return draft_text, model
+
+def draft_reply(
+    *,
+    subject: str | None = None,
+    sender: str | None = None,
+    body_html: str | None = None,
+    body_preview: str | None = None,
+    tone: str | None = "professional",
+    instructions: str | None = None,
+) -> tuple[str, str]:
+    """
+    Generates a reply draft for an email thread.
+    Uses Responses API (works with gpt-5-nano; no temperature/response_format kwargs).
+    Returns: (draft_text, model)
+    """
+    client = get_openai_client()
+    model = os.getenv("OPENAI_MODEL", "gpt-5-nano")
+
+    body_text = safe_text(_coerce_body_text(body_html, body_preview), 12000)
+
+    prompt = user_prompt_for_draft(
+        subject=safe_text(subject or "", 300),
+        sender=safe_text(sender or "", 300),
+        body_text=body_text,
+        tone=safe_text(tone or "professional", 50),
+        instructions=safe_text(instructions or "", 1000) if instructions else None,
+    )
+
+    resp = _responses_create_text(
+        client,
+        model=model,
+        system_text=SYSTEM_DRAFT,
+        user_text=prompt,
+        file_ids=[],
+    )
+
+    draft_text = _response_text(resp).strip()
+    if not draft_text:
+        draft_text = "Thanks for the update. We will review and follow up with next steps."
+    return draft_text, model
+
+
+================================================================================
+app/api\attachments.py:
+
+from __future__ import annotations
+
+import os
+from fastapi import APIRouter, HTTPException
+from fastapi.responses import FileResponse
+
+from app.mysql_ops import MysqlOps
+
+router = APIRouter()
+
+def _safe_abs_path(p: str) -> str:
+    if not p:
+        raise HTTPException(status_code=404, detail="Attachment file missing")
+
+    abs_p = os.path.abspath(p)
+    base = os.path.abspath(os.path.join(os.getcwd(), "storage", "attachments"))
+
+    # Prevent path traversal / arbitrary file download
+    if not abs_p.startswith(base + os.sep) and abs_p != base:
+        raise HTTPException(status_code=400, detail="Invalid attachment path")
+
+    if not os.path.exists(abs_p):
+        raise HTTPException(status_code=404, detail="Attachment file not found")
+
+    return abs_p
+
+
+@router.get("/emails/{email_id}")
+def list_attachments(email_id: int):
+    ops = MysqlOps()
+    email = ops.get_email_by_id(email_id)
+    if not email:
+        raise HTTPException(status_code=404, detail="Email not found")
+
+    rows = ops.list_attachments_for_email(email_id)
+    return {
+        "email_id": email_id,
+        "count": len(rows),
+        "items": [
+            {
+                "id": a.id,
+                "attachment_id": a.attachment_id,
+                "name": a.name,
+                "content_type": a.content_type,
+                "size": a.size,
+                "is_inline": bool(a.is_inline),
+                "content_id": a.content_id,
+                "local_path": a.local_path,
+                "openai_file_id": getattr(a, "openai_file_id", None),
+            }
+            for a in rows
+        ],
+    }
+
+
+@router.get("/{attachment_row_id}/download")
+def download_attachment(attachment_row_id: int):
+    ops = MysqlOps()
+    # You don't have a direct getter; easiest is query by email list,
+    # but better to add a small method. For now, do a quick workaround:
+    # Add this method in MysqlOps if you want it clean.
+    from sqlalchemy import select
+    from app.db import SessionLocal
+    from app.models import EmailAttachment
+
+    with SessionLocal() as db:
+        a = db.get(EmailAttachment, attachment_row_id)
+
+    if not a:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+
+    abs_path = _safe_abs_path(a.local_path or "")
+    filename = a.name or os.path.basename(abs_path)
+
+    return FileResponse(
+        abs_path,
+        media_type=a.content_type or "application/octet-stream",
+        filename=filename,
+    )
+
+
+================================================================================
+app/api\cases.py:
+
+from fastapi import APIRouter, HTTPException
+from app.core.types import CaseCreate, CaseUpdate
+from app.core.status_rules import normalize_status
+from app.mysql_ops import MysqlOps
+from typing import Optional
+
+from app.ai.tasks import draft_case_acceptance
+from pydantic import BaseModel, Field
+
+from app.graph.reply import create_reply_draft, update_draft_message, send_draft_message
+import html
+
+
+class StaffingConfirmIn(BaseModel):
+    therapist_name: Optional[str] = None
+    discipline: Optional[str] = None
+    availability: Optional[str] = None
+
+    # Accept both referral_email and referral_source_email
+    referral_email: Optional[str] = Field(default=None, alias="referral_source_email")
+
+    class Config:
+        populate_by_name = True
+
+
+class AcceptanceDraftOut(BaseModel):
+    case_id: int
+    draft_id: int
+    email_id: int
+    model: str
+    graph_draft_message_id: Optional[str] = None  # NEW (safe even if DB not migrated yet)
+
+
+class AcceptanceSendOut(BaseModel):
+    ok: bool
+    case_id: int
+    draft_id: int
+    email_id: int
+    mailbox: str
+    status: str
+
+def _strip_subject_header(draft_text: str) -> str:
+    if not draft_text:
+        return ""
+    lines = draft_text.splitlines()
+    if lines and lines[0].strip().lower().startswith("subject:"):
+        lines = lines[1:]
+        if lines and lines[0].strip() == "":
+            lines = lines[1:]
+    return "\n".join(lines).strip()
+
+
+def _text_to_simple_html(text: str) -> str:
+    # Safe basic conversion; Outlook accepts simple HTML well
+    text = (text or "").strip()
+    escaped = html.escape(text)
+    return "<div>" + escaped.replace("\n", "<br>") + "</div>"
+
+
+router = APIRouter()
+
+
+@router.get("/")
+def list_cases(limit: int = 50):
+    ops = MysqlOps()
+    rows = ops.list_cases()[:limit]
+    return {
+        "items": [
+            {
+                "id": r.id,
+                "external_id": r.external_id,
+                "title": r.title,
+                "status": r.status,
+                "metadata": r.metadata_json,
+            }
+            for r in rows
+        ]
+    }
+
+
+@router.get("/{case_id}/timeline")
+def case_timeline(case_id: int, limit: int = 200):
+    ops = MysqlOps()
+    emails = ops.list_emails_for_case(case_id, limit=limit)
+
+    items = []
+    for e in emails:
+        atts = ops.list_attachments_for_email(e.id)
+
+        items.append(
+            {
+                "id": e.id,
+                "subject": e.subject,
+                "sender": e.sender,
+                "received_datetime": e.received_datetime,
+                "body_preview": e.body_preview,
+                "mailbox": getattr(e, "mailbox", None),
+                "conversation_id": e.conversation_id,
+                "has_attachments": len(atts) > 0,
+                "attachments": [
+                    {
+                        "id": a.id,
+                        "attachment_id": a.attachment_id,
+                        "name": a.name,
+                        "content_type": a.content_type,
+                        "size": a.size,
+                        "is_inline": bool(a.is_inline),
+                        "content_id": a.content_id,
+                        "local_path": a.local_path,
+                    }
+                    for a in atts
+                ],
+            }
+        )
+
+    return {"case_id": case_id, "count": len(items), "items": items}
+
+
+@router.post("/")
+def create_case(payload: CaseCreate):
+    ops = MysqlOps()
+    case_id = ops.create_case(
+        external_id=payload.external_id,
+        title=payload.title,
+        status=normalize_status(payload.status),
+        metadata=payload.metadata,
+    )
+    return {"id": case_id}
+
+
+@router.patch("/{case_id}")
+def update_case(case_id: int, payload: CaseUpdate):
+    ops = MysqlOps()
+
+    # Title/status can be direct updates
+    fields = {}
+    if payload.title is not None:
+        fields["title"] = payload.title
+    if payload.status is not None:
+        fields["status"] = normalize_status(payload.status)
+
+    # Metadata should be merged, not replaced
+    if payload.metadata is not None:
+        if not isinstance(payload.metadata, dict):
+            raise HTTPException(status_code=400, detail="metadata must be an object")
+        ops.merge_case_metadata(case_id, payload.metadata)
+
+    if fields:
+        try:
+            ops.update_case(case_id, fields)
+        except ValueError:
+            raise HTTPException(status_code=404, detail="Case not found")
+    elif payload.metadata is None:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    return {"ok": True}
+
+
+@router.post("/{case_id}/staffing/confirm")
+def confirm_staffing(case_id: int, body: StaffingConfirmIn):
+    ops = MysqlOps()
+    c = ops.get_case_by_id(case_id)
+    if not c:
+        raise HTTPException(status_code=404, detail="Case not found")
+
+    current = (c.status or "").strip().lower()
+    if current in {"acceptance drafted", "closed"}:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot confirm staffing from status '{c.status}'",
+        )
+
+    payload = {
+        "therapist_name": body.therapist_name,
+        "discipline": body.discipline,
+        "availability": body.availability,
+        "referral_email": body.referral_email,
+    }
+
+    ops.merge_case_metadata(case_id, {"staffing": payload})
+
+    if not ops.case_event_exists_any(case_id=case_id, email_id=None, event_type="staffed"):
+        ops.create_case_event(
+            case_id=case_id,
+            email_id=None,
+            event_type="staffed",
+            actor="human",
+            payload=payload,
+        )
+
+    ops.update_case(case_id, {"status": "staffed"})
+    return {"ok": True, "case_id": case_id, "status": "staffed"}
+
+
+@router.post("/{case_id}/drafts/acceptance", response_model=AcceptanceDraftOut)
+def create_acceptance_draft(case_id: int):
+    ops = MysqlOps()
+    c = ops.get_case_by_id(case_id)
+    if not c:
+        raise HTTPException(status_code=404, detail="Case not found")
+
+    current = (c.status or "").strip().lower()
+    if current == "acceptance drafted":
+        raise HTTPException(status_code=400, detail="Acceptance draft already created for this case")
+    if current != "staffed":
+        raise HTTPException(status_code=400, detail="Case must be staffed before drafting acceptance")
+
+    meta = c.metadata_json or {}
+    if not isinstance(meta, dict):
+        meta = {}
+
+    if "staffing" not in meta:
+        raise HTTPException(
+            status_code=400,
+            detail="Staffing has not been confirmed yet. Call /staffing/confirm first.",
+        )
+
+    staffing = meta.get("staffing") or {}
+    if not isinstance(staffing, dict):
+        staffing = {}
+
+    referral_email = staffing.get("referral_email")
+    therapist_name = staffing.get("therapist_name")
+    discipline = staffing.get("discipline")
+    availability = staffing.get("availability")
+
+    seed_email_id = meta.get("seed_email_id")
+    email_id = int(seed_email_id) if seed_email_id else None
+    if not email_id:
+        latest = ops.get_latest_email_for_case(case_id)
+        if latest:
+            email_id = latest.id
+
+    if not email_id:
+        raise HTTPException(status_code=400, detail="No email found to attach the draft to")
+
+    # Generate acceptance text (LLM)
+    draft_text, model = draft_case_acceptance(
+        case_title=c.title,
+        referral_source_email=referral_email,
+        therapist_name=therapist_name,
+        discipline=discipline,
+        availability=availability,
+    )
+
+    # Create Graph draft in the staffing mailbox (reply draft)
+    email_row = ops.get_email_by_id(int(email_id))
+    if not email_row:
+        raise HTTPException(status_code=404, detail="Seed email not found")
+
+    mailbox = (email_row.mailbox or "").strip()
+    message_id = (email_row.message_id or "").strip()  # Graph message id of the original email
+
+    if not mailbox:
+        raise HTTPException(status_code=400, detail="Seed email mailbox missing")
+    if not message_id:
+        raise HTTPException(status_code=400, detail="Seed email message_id missing")
+
+    graph_draft = create_reply_draft(mailbox=mailbox, message_id=message_id)
+    graph_draft_id = (graph_draft.get("id") or "").strip()
+    graph_weblink = (graph_draft.get("webLink") or "").strip() if isinstance(graph_draft.get("webLink"), str) else None
+
+    if not graph_draft_id:
+        raise HTTPException(status_code=500, detail="Graph did not return draft id")
+
+    body_text = _strip_subject_header(draft_text or "")
+    body_html = _text_to_simple_html(body_text)
+
+    # If referral_email is provided, force To to that email; otherwise keep default reply recipients
+    to_list = [referral_email] if referral_email else None
+
+    update_draft_message(
+        mailbox=mailbox,
+        draft_message_id=graph_draft_id,
+        body_html=body_html,
+        to_recipients=to_list,
+    )
+
+    # Store in DB (including graph draft id if your MysqlOps.create_draft supports it)
+    try:
+        draft_id = ops.create_draft(
+            email_id=email_id,
+            draft=draft_text,
+            model=model,
+            tone="professional",
+            mailbox=mailbox,
+            graph_draft_message_id=graph_draft_id,
+            graph_draft_web_link=graph_weblink,
+        )
+    except TypeError:
+        # Backward-compatible fallback if create_draft signature isn't updated yet
+        draft_id = ops.create_draft(
+            email_id=email_id,
+            draft=draft_text,
+            model=model,
+            tone="professional",
+        )
+
+    ops.update_case(case_id, {"status": "acceptance drafted"})
+
+    if not ops.case_event_exists_any(case_id=case_id, email_id=email_id, event_type="acceptance_draft_created"):
+        ops.create_case_event(
+            case_id=case_id,
+            email_id=email_id,
+            event_type="acceptance_draft_created",
+            actor="ai",
+            payload={
+                "referral_email": referral_email,
+                "graph_draft_message_id": graph_draft_id,
+                "graph_draft_web_link": graph_weblink,
+            },
+        )
+
+    return AcceptanceDraftOut(
+        case_id=case_id,
+        draft_id=draft_id,
+        email_id=email_id,
+        model=model,
+        graph_draft_message_id=graph_draft_id,
+    )
+
+
+@router.get("/{case_id}")
+def get_case(case_id: int):
+    ops = MysqlOps()
+    c = ops.get_case_by_id(case_id)
+    if not c:
+        raise HTTPException(status_code=404, detail="Case not found")
+
+    return {
+        "id": c.id,
+        "external_id": c.external_id,
+        "title": c.title,
+        "status": c.status,
+        "metadata": c.metadata_json,
+    }
+
+@router.post("/{case_id}/drafts/acceptance/send", response_model=AcceptanceSendOut)
+def send_acceptance_draft(case_id: int):
+    ops = MysqlOps()
+    c = ops.get_case_by_id(case_id)
+    if not c:
+        raise HTTPException(status_code=404, detail="Case not found")
+
+    current = (c.status or "").strip().lower()
+    if current != "acceptance drafted":
+        raise HTTPException(status_code=400, detail="Case must be in 'acceptance drafted' status before sending")
+
+    meta = c.metadata_json or {}
+    if not isinstance(meta, dict):
+        meta = {}
+
+    seed_email_id = meta.get("seed_email_id")
+    email_id = int(seed_email_id) if seed_email_id else None
+    if not email_id:
+        latest = ops.get_latest_email_for_case(case_id)
+        if latest:
+            email_id = latest.id
+
+    if not email_id:
+        raise HTTPException(status_code=400, detail="No email found to send acceptance against")
+
+    # Find the latest draft for this email
+    d = ops.get_latest_draft_for_email(int(email_id))
+    if not d:
+        raise HTTPException(status_code=404, detail="No draft found for this case/email")
+
+    if (d.status or "draft") == "sent":
+        raise HTTPException(status_code=400, detail="Draft already sent")
+
+    mailbox = (getattr(d, "mailbox", None) or "").strip()
+    graph_id = (getattr(d, "graph_draft_message_id", None) or "").strip()
+
+    if not mailbox:
+        raise HTTPException(status_code=400, detail="Draft mailbox missing (cannot send via Graph)")
+    if not graph_id:
+        raise HTTPException(status_code=400, detail="Draft graph_draft_message_id missing (cannot send via Graph)")
+
+    # Send via Graph
+    try:
+        send_draft_message(mailbox=mailbox, draft_message_id=graph_id)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Graph send failed: {str(e)}")
+
+    # Mark draft + case
+    ops.mark_draft_sent(d.id, mailbox=mailbox, sent_message_id=None)
+    ops.update_case(case_id, {"status": "acceptance sent"})
+
+    # Case event
+    if not ops.case_event_exists_any(case_id=case_id, email_id=int(email_id), event_type="acceptance_sent"):
+        ops.create_case_event(
+            case_id=case_id,
+            email_id=int(email_id),
+            event_type="acceptance_sent",
+            actor="ai",
+            payload={
+                "draft_id": d.id,
+                "mailbox": mailbox,
+                "graph_draft_message_id": graph_id,
+                "graph_draft_web_link": getattr(d, "graph_draft_web_link", None),
+            },
+        )
+
+    return AcceptanceSendOut(
+        ok=True,
+        case_id=case_id,
+        draft_id=d.id,
+        email_id=int(email_id),
+        mailbox=mailbox,
+        status="acceptance sent",
+    )
+
+
+================================================================================
+app/api\drafts.py:
+
+from __future__ import annotations
+
+from typing import Optional
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+
+from app.mysql_ops import MysqlOps
+from app.ai.tasks import draft_reply
+
+import html
+from app.graph.reply import create_reply_draft, update_draft_message, send_draft_message
+
+import os
+
+router = APIRouter()
+
+
+class DraftCreateIn(BaseModel):
+    tone: str = "professional"
+    instructions: Optional[str] = None
+
+
+class DraftSendOut(BaseModel):
+    ok: bool
+    draft_id: int
+    email_id: int
+    mailbox: str
+    status: str
+
+
+def _strip_subject_header(draft_text: str) -> str:
+    """
+    Your drafts often start with:
+      Subject: ...
+      <blank line>
+      Hello,...
+
+    Graph /reply takes only a comment/body. Strip the Subject line if present.
+    """
+    if not draft_text:
+        return ""
+
+    lines = draft_text.splitlines()
+    if lines and lines[0].strip().lower().startswith("subject:"):
+        lines = lines[1:]
+        # drop one optional blank line
+        if lines and lines[0].strip() == "":
+            lines = lines[1:]
+
+    return "\n".join(lines).strip()
+
+def _text_to_simple_html(text: str) -> str:
+    text = (text or "").strip()
+    escaped = html.escape(text)
+    return "<div>" + escaped.replace("\n", "<br>") + "</div>"
+
+
+@router.post("/emails/{email_id}")
+def create_draft(email_id: int, body: DraftCreateIn):
+    ops = MysqlOps()
+    email = ops.get_email_by_id(email_id)
+    if not email:
+        raise HTTPException(status_code=404, detail="Email not found")
+
+    draft_text, model = draft_reply(
+        subject=email.subject or "",
+        sender=email.sender or "",
+        body_html=email.body_html,
+        body_preview=email.body_preview,
+        tone=body.tone,
+        instructions=body.instructions,
+    )
+
+    mailbox = (getattr(email, "mailbox", None) or "").strip()
+    message_id = (getattr(email, "message_id", None) or "").strip()  # Graph message id
+
+    if not mailbox:
+        raise HTTPException(status_code=400, detail="Email mailbox missing (cannot create Graph draft)")
+    if not message_id:
+        raise HTTPException(status_code=400, detail="Email message_id missing (cannot create Graph draft)")
+
+    # Create Graph reply draft
+    graph_draft = create_reply_draft(mailbox=mailbox, message_id=message_id)
+    graph_draft_id = (graph_draft.get("id") or "").strip()
+    graph_weblink = (graph_draft.get("webLink") or "").strip() if isinstance(graph_draft.get("webLink"), str) else None
+
+    if not graph_draft_id:
+        raise HTTPException(status_code=502, detail="Graph did not return draft id")
+
+    # Update Graph draft body
+    body_text = _strip_subject_header(draft_text or "")
+    body_html = _text_to_simple_html(body_text)
+
+    update_draft_message(
+        mailbox=mailbox,
+        draft_message_id=graph_draft_id,
+        body_html=body_html,
+        to_recipients=None,  # keep default reply recipients
+    )
+
+    # Save draft in DB with graph fields
+    try:
+        draft_id = ops.create_draft(
+            email_id=email_id,
+            draft=draft_text,
+            model=model,
+            tone=body.tone,
+            mailbox=mailbox,
+            graph_draft_message_id=graph_draft_id,
+            graph_draft_web_link=graph_weblink,
+        )
+    except TypeError:
+        # Backward compatible if create_draft doesn't support new params yet
+        draft_id = ops.create_draft(
+            email_id=email_id,
+            draft=draft_text,
+            model=model,
+            tone=body.tone,
+            mailbox=mailbox,
+        )
+
+    return {"draft_id": draft_id, "email_id": email_id, "model": model}
+
+
+@router.get("/emails/{email_id}")
+def list_email_drafts(email_id: int, limit: int = 20):
+    ops = MysqlOps()
+    rows = ops.list_drafts_for_email(email_id=email_id, limit=limit)
+    return {
+        "items": [
+            {
+                "id": d.id,
+                "model": d.model,
+                "tone": d.tone,
+                "status": getattr(d, "status", "draft"),
+                "created_at": d.created_at.isoformat() if d.created_at else None,
+                "sent_at": d.sent_at.isoformat() if getattr(d, "sent_at", None) else None,
+            }
+            for d in rows
+        ]
+    }
+
+
+@router.get("/{draft_id}")
+def get_draft(draft_id: int):
+    ops = MysqlOps()
+    d = ops.get_draft_by_id(draft_id)
+    if not d:
+        raise HTTPException(status_code=404, detail="Draft not found")
+
+    return {
+        "id": d.id,
+        "email_id": d.email_id,
+        "draft": d.draft,
+        "model": d.model,
+        "tone": d.tone,
+        "status": getattr(d, "status", "draft"),
+        "mailbox": getattr(d, "mailbox", None),
+        "graph_draft_message_id": getattr(d, "graph_draft_message_id", None),
+        "graph_draft_web_link": getattr(d, "graph_draft_web_link", None),
+        "sent_message_id": getattr(d, "sent_message_id", None),
+        "sent_at": d.sent_at.isoformat() if getattr(d, "sent_at", None) else None,
+        "created_at": d.created_at.isoformat() if d.created_at else None,
+    }
+
+
+@router.post("/{draft_id}/send", response_model=DraftSendOut)
+def send_draft(draft_id: int):
+    ops = MysqlOps()
+    d = ops.get_draft_by_id(draft_id)
+    if not d:
+        raise HTTPException(status_code=404, detail="Draft not found")
+
+    if (d.status or "draft") == "sent":
+        raise HTTPException(status_code=400, detail="Draft already sent")
+
+    mailbox = (getattr(d, "mailbox", None) or "").strip()
+    graph_id = (getattr(d, "graph_draft_message_id", None) or "").strip()
+
+    if not mailbox:
+        raise HTTPException(status_code=400, detail="Draft mailbox missing (cannot send)")
+    if not graph_id:
+        raise HTTPException(status_code=400, detail="Draft has no graph_draft_message_id (cannot send)")
+
+    try:
+        send_draft_message(mailbox=mailbox, draft_message_id=graph_id)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Graph send failed: {str(e)}")
+
+    ops.mark_draft_sent(draft_id, mailbox=mailbox, sent_message_id=None)
+
+    return DraftSendOut(
+        ok=True,
+        draft_id=draft_id,
+        email_id=d.email_id,
+        mailbox=mailbox,
+        status="sent",
+    )
+
+
+================================================================================
+app/api\emails.py:
+
+from __future__ import annotations
+
+from fastapi import APIRouter, HTTPException, Query
+from app.mysql_ops import MysqlOps
+
+router = APIRouter()
+
+@router.get("/")
+def list_emails(limit: int = Query(default=50, ge=1, le=200)):
+    ops = MysqlOps()
+    rows = ops.list_emails(limit=limit)
+    return {
+        "items": [
+            {
+                "id": r.id,
+                "subject": r.subject,
+                "sender": r.sender,
+                "sender_name": r.sender_name,
+                "received_datetime": r.received_datetime,
+                "message_id": r.message_id,
+                "internet_message_id": r.internet_message_id,
+                "conversation_id": r.conversation_id,
+            }
+            for r in rows
+        ]
+    }
+
+@router.get("/{email_id}")
+def get_email(email_id: int):
+    ops = MysqlOps()
+    r = ops.get_email_by_id(email_id)
+    if not r:
+        raise HTTPException(status_code=404, detail="Email not found")
+
+    return {
+        "id": r.id,
+        "subject": r.subject,
+        "sender": r.sender,
+        "sender_name": r.sender_name,
+        "to_list": r.to_list,
+        "cc_list": r.cc_list,
+        "received_datetime": r.received_datetime,
+        "body_preview": r.body_preview,
+        "body_html": r.body_html,
+        "message_id": r.message_id,
+        "internet_message_id": r.internet_message_id,
+        "conversation_id": r.conversation_id,
+        "raw_json": r.raw_json,
+    }
+
+
+================================================================================
+app/api\main.py:
+
+from __future__ import annotations
+
+import os
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.api.cases import router as cases_router
+from app.api.drafts import router as drafts_router
+from app.api.emails import router as emails_router
+from app.api.attachments import router as attachments_router
+
+def create_app() -> FastAPI:
+    app = FastAPI(title=os.getenv("APP_NAME", "TdpAgent"))
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    @app.get("/health")
+    def health():
+        return {"ok": True}
+
+    app.include_router(cases_router, prefix="/cases", tags=["cases"])
+    app.include_router(drafts_router, prefix="/drafts", tags=["drafts"])
+    app.include_router(emails_router, prefix="/emails", tags=["emails"])
+    app.include_router(attachments_router, prefix="/attachments", tags=["attachments"])
+
+    return app
+
+app = create_app()
+
+
+================================================================================
+app/core\audit.py:
+
+import json
+import time
+from typing import Any, Dict
+
+def audit_event(event: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "ts": int(time.time()),
+        "event": event,
+        "payload": payload,
+    }
+
+def audit_print(event: str, payload: Dict[str, Any]) -> None:
+    print(json.dumps(audit_event(event, payload), ensure_ascii=False))
+
+
+================================================================================
+app/core\deps_check.py:
+
+def check_attachment_extract_deps() -> None:
+    missing = []
+
+    try:
+        import docx  # noqa
+    except Exception:
+        missing.append("python-docx")
+
+    try:
+        from pdfminer.high_level import extract_text  # noqa
+    except Exception:
+        missing.append("pdfminer.six")
+
+    if missing:
+        raise RuntimeError(f"Missing deps for attachment extraction: {', '.join(missing)}")
+
+
+================================================================================
+app/core\event_rules.py:
+
+# app/core/event_rules.py
+
+from __future__ import annotations
+from typing import Optional, Dict, Any
+import re
+
+_EVAL_RE = re.compile(r"\b(?:ot|pt|st)?\s*eval(?:uation)?\b", re.IGNORECASE)
+_AUTH_RE = re.compile(r"\b(?:prior\s*auth|prior\s*authorization|authorization)\b", re.IGNORECASE)
+
+# Auth request / pending (non-approved, non-denied)
+_AUTH_REQUEST_RE = re.compile(
+    r"\b(?:"
+    r"auth(?:orization)?\s*(?:needed|required|requested|request(?:ed)?)|"
+    r"request\s*for\s*(?:auth|authorization)|"
+    r"(?:auth|authorization)\s*(?:pending|needed|required)|"
+    r"pending\s*(?:auth|authorization)|"
+    r"need\s*(?:prior\s*)?auth|"
+    r"prior\s*auth\s*(?:needed|required)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+def classify_email_event(
+    email: Dict[str, Any],
+    mailbox: str,
+    attachments: list[dict] | None = None,
+) -> Optional[str]:
+    sender = (email.get("sender") or "").lower()
+    subject = (email.get("subject") or "")
+    subject_l = subject.lower()
+    body_preview_l = (email.get("body_preview") or "").lower()
+
+    mb = (mailbox or "").lower()
+
+    # Treat these mailboxes as "intake-ish"
+    is_staffing_like = mb.startswith("staffing@")
+    is_services_like = mb.startswith("services@") or mb.startswith("schedulingtdp@")
+
+    internal_domain = "@therapydepotonline.com"
+    is_external = internal_domain not in sender
+
+    # Stage 1: Referral intake (typically external -> staffing)
+    if is_staffing_like:
+        referral_keywords = [
+            "new case referral",
+            "securemail: new case referral",
+            "referral",
+            "facesheet",
+            "face sheet",
+            "demographics",
+            "patient referral",
+        ]
+        has_referral_signal = any(k in subject_l or k in body_preview_l for k in referral_keywords)
+        if is_external and has_referral_signal:
+            return "referral_received"
+
+    if is_services_like:
+        # Stage 4: Evaluation received
+        if _EVAL_RE.search(subject) or _EVAL_RE.search(body_preview_l):
+            return "evaluation_received"
+
+        # Attachment name heuristic
+        if attachments:
+            for a in attachments:
+                name = (a.get("name") or "")
+                if name and _EVAL_RE.search(name):
+                    return "evaluation_received"
+
+        # Stage 5: Authorization request / pending
+        if _AUTH_REQUEST_RE.search(subject) or _AUTH_REQUEST_RE.search(body_preview_l):
+            return "authorization_request"
+
+        # Backup: generic auth mention WITHOUT approval/denial language => treat as request/pending
+        if _AUTH_RE.search(subject) or _AUTH_RE.search(body_preview_l):
+            approval_words = ["approved", "approval", "authorized", "granted"]
+            denial_words = ["denied", "rejected", "not approved"]
+            if not any(w in subject_l or w in body_preview_l for w in approval_words + denial_words):
+                return "authorization_request"
+
+        # Stage 6: Authorization approval received
+        auth_approved_keywords = [
+            "authorization approved",
+            "auth approved",
+            "approved authorization",
+            "prior auth approved",
+            "pa approved",
+            "approved pa",
+        ]
+        if any(k in subject_l or k in body_preview_l for k in auth_approved_keywords):
+            return "authorization_approved"
+
+        # Backup: detect generic auth text + approval word
+        if (_AUTH_RE.search(subject) or _AUTH_RE.search(body_preview_l)) and (
+            "approved" in subject_l or "approved" in body_preview_l
+        ):
+            return "authorization_approved"
+
+    return None
+
+
+================================================================================
+app/core\intent_rules.py:
+
+from __future__ import annotations
+
+INTENT_TO_STATUS = {
+    "referral_received": "pending staffing",
+    "staffing_confirmation": "staffed",
+    "evaluation_received": "evaluation completed",
+    "authorization_request": "authorization pending",
+    "authorization_approved": "authorized – treatment started",
+}
+
+TERMINAL_STATUSES = {"closed"}
+
+def can_apply_intent(current_status: str | None, intent: str) -> bool:
+    s = (current_status or "").strip().lower()
+    if s in TERMINAL_STATUSES:
+        return False
+    # Add stricter rules later if needed
+    return intent in INTENT_TO_STATUS
+
+def status_for_intent(intent: str) -> str | None:
+    return INTENT_TO_STATUS.get(intent)
+
+
+================================================================================
+app/core\matcher.py:
+
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Optional
+import re
+
+@dataclass
+class MatchResult:
+    case_key: Optional[str] = None
+    reason: str = "no_match"
+
+_CASE_ID_RE = re.compile(r"\bCASE[- ]?(\d{3,})\b", re.IGNORECASE)
+
+def match_case_from_subject(subject: str) -> MatchResult:
+    if not subject:
+        return MatchResult()
+    m = _CASE_ID_RE.search(subject)
+    if not m:
+        return MatchResult()
+    return MatchResult(case_key=f"CASE-{m.group(1)}", reason="case_id_in_subject")
+
+
+================================================================================
+app/core\sanitize.py:
+
+import re
+from html import unescape
+
+_TAG_RE = re.compile(r"<[^>]+>")
+
+def strip_html(html: str) -> str:
+    if not html:
+        return ""
+    text = _TAG_RE.sub(" ", html)
+    text = unescape(text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+def safe_email(s: str) -> str:
+    if not s:
+        return ""
+    return s.strip().lower()
+
+def safe_text(s: str, max_len: int = 5000) -> str:
+    if not s:
+        return ""
+    s = s.strip()
+    if len(s) > max_len:
+        s = s[:max_len]
+    return s
+
+
+================================================================================
+app/core\status_rules.py:
+
+def normalize_status(status: str) -> str:
+    if not status:
+        return "new"
+
+    s = status.strip().lower()
+
+    allowed = {
+        "new",
+        "pending staffing",
+        "staffed",
+        "acceptance drafted",
+        "acceptance sent",
+        "evaluation completed",
+        "authorization pending",
+        "authorized – treatment started",
+        "authorized - treatment started",  # allow hyphen variant
+        "closed",
+    }
+
+    if s == "authorized - treatment started":
+        s = "authorized – treatment started"
+
+    return s if s in allowed else "new"
+
+================================================================================
+app/core\types.py:
+
+from __future__ import annotations
+
+from pydantic import BaseModel, Field
+from typing import Optional, Dict, Any, List
+
+
+class Settings(BaseModel):
+    # App
+    APP_ENV: str = Field(default="local")
+    APP_NAME: str = Field(default="TdpAgent")
+    LOG_LEVEL: str = Field(default="INFO")
+
+    # OpenAI
+    OPENAI_API_KEY: str = Field(default="")
+    OPENAI_MODEL: str = Field(default="gpt-5-nano")
+
+    # Microsoft Graph (client credentials)
+    MS_TENANT_ID: str = Field(default="")
+    MS_CLIENT_ID: str = Field(default="")
+    MS_CLIENT_SECRET: str = Field(default="")
+    MS_USER_ID: str = Field(default="")  # user mailbox UPN or id
+    GRAPH_SCOPE: str = Field(default="https://graph.microsoft.com/.default")
+    GRAPH_FETCH_LIMIT: int = Field(default=10)
+
+    # Tadabase
+    TADABASE_BASE_URL: str = Field(default="https://api.tadabase.io/api/v1")
+    TADABASE_APP_ID: str = Field(default="")
+    TADABASE_API_KEY: str = Field(default="")
+    # Data table ids
+    TADABASE_TABLE_EMAILS: str = Field(default="")
+    TADABASE_TABLE_CASES: str = Field(default="")
+    TADABASE_TABLE_DRAFTS: str = Field(default="")
+    TADABASE_TABLE_SYNC_STATE: str = Field(default="")  # store deltaLink/lastSync
+
+    # Worker
+    POLL_INTERVAL_SECONDS: int = Field(default=30)
+
+
+class EmailItem(BaseModel):
+    message_id: str
+    internet_message_id: Optional[str] = None
+    subject: Optional[str] = None
+    sender: Optional[str] = None
+    sender_name: Optional[str] = None
+    to: List[str] = Field(default_factory=list)
+    cc: List[str] = Field(default_factory=list)
+    received_datetime: Optional[str] = None
+    body_preview: Optional[str] = None
+    body_html: Optional[str] = None
+    conversation_id: Optional[str] = None
+    raw: Dict[str, Any] = Field(default_factory=dict)
+
+
+class DraftRequest(BaseModel):
+    email_id: str
+    tone: str = "professional"
+    instructions: Optional[str] = None
+
+
+class DraftResponse(BaseModel):
+    draft: str
+    model: str
+
+
+class CaseCreate(BaseModel):
+    external_id: Optional[str] = None
+    title: str
+    status: str = "new"
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class CaseUpdate(BaseModel):
+    title: Optional[str] = None
+    status: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+================================================================================
+app/graph\attachments.py:
+
+from __future__ import annotations
+
+import requests
+from typing import Any, Dict, List
+
+from app.graph.auth import get_graph_token
+
+GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+
+
+def _headers() -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {get_graph_token()}",
+        "Accept": "application/json",
+    }
+
+
+def fetch_attachments(mailbox: str, message_id: str) -> List[Dict[str, Any]]:
+    url = f"{GRAPH_BASE}/users/{mailbox}/messages/{message_id}/attachments"
+    r = requests.get(url, headers=_headers(), timeout=60)
+    r.raise_for_status()
+    return (r.json().get("value", []) or [])
+
+
+================================================================================
+app/graph\auth.py:
+
+from __future__ import annotations
+import os
+import time
+import requests
+
+_TOKEN_CACHE = {"access_token": None, "exp": 0}
+
+def get_graph_token() -> str:
+    tenant = os.getenv("MS_TENANT_ID", "")
+    client_id = os.getenv("MS_CLIENT_ID", "")
+    client_secret = os.getenv("MS_CLIENT_SECRET", "")
+    scope = os.getenv("GRAPH_SCOPE", "https://graph.microsoft.com/.default")
+
+    if not (tenant and client_id and client_secret):
+        raise RuntimeError("MS_TENANT_ID/MS_CLIENT_ID/MS_CLIENT_SECRET missing")
+
+    now = int(time.time())
+    if _TOKEN_CACHE["access_token"] and now < (_TOKEN_CACHE["exp"] - 60):
+        return _TOKEN_CACHE["access_token"]
+
+    url = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+    data = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "grant_type": "client_credentials",
+        "scope": scope,
+    }
+    r = requests.post(url, data=data, timeout=30)
+    if not r.ok:
+        raise RuntimeError(f"Token request failed: {r.status_code} {r.text}")
+    j = r.json()
+
+    _TOKEN_CACHE["access_token"] = j["access_token"]
+    _TOKEN_CACHE["exp"] = now + int(j.get("expires_in", 3600))
+    return _TOKEN_CACHE["access_token"]
+
+
+================================================================================
+app/graph\mail.py:
+
+from __future__ import annotations
+
+import requests
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
+
+from app.graph.auth import get_graph_token
+from app.core.sanitize import safe_email
+
+GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+
+
+def _headers() -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {get_graph_token()}",
+        "Accept": "application/json",
+    }
+
+
+# Keep the selected fields consistent across delta + since
+_SELECT_FIELDS = (
+    "id,"
+    "internetMessageId,"
+    "subject,"
+    "receivedDateTime,"
+    "conversationId,"
+    "bodyPreview,"
+    "from,"
+    "toRecipients,"
+    "ccRecipients,"
+    "body,"
+    "hasAttachments"
+)
+
+
+def fetch_messages_delta_for_mailbox(
+    mailbox: str,
+    delta_link: Optional[str],
+    top: int,
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """
+    If delta_link exists: fetch up to `top` changes and return quickly (ok to stop early).
+    If delta_link missing (baseline): MUST paginate until @odata.deltaLink is returned,
+    otherwise you never "lock in" delta state.
+
+    Returns (messages, new_delta_link_or_none)
+    """
+    if delta_link:
+        url = delta_link
+    else:
+        url = (
+            f"{GRAPH_BASE}/users/{mailbox}/mailFolders/Inbox/messages/delta"
+            f"?$top={top}&$select={_SELECT_FIELDS}"
+        )
+
+    items: List[Dict[str, Any]] = []
+    next_delta: Optional[str] = None
+
+    # baseline needs full walk to reach @odata.deltaLink
+    baseline = delta_link is None
+
+    while url:
+        r = requests.get(url, headers=_headers(), timeout=60)
+        r.raise_for_status()
+        j = r.json()
+
+        items.extend(j.get("value", []) or [])
+
+        # deltaLink appears only at the end of paging
+        if j.get("@odata.deltaLink"):
+            next_delta = j["@odata.deltaLink"]
+            break
+
+        # keep going if there's a nextLink
+        url = j.get("@odata.nextLink")
+
+        # if NOT baseline, we can return quickly after collecting `top` items
+        if (not baseline) and len(items) >= top:
+            break
+
+        # baseline safety: if Graph doesn't give nextLink and no deltaLink, we can't continue
+        if baseline and not url:
+            break
+
+    # We only return up to `top` messages to limit processing load,
+    # but baseline still paged until deltaLink.
+    # If baseline, return everything we collected (do NOT truncate),
+    # because truncating + storing deltaLink skips history forever.
+    if baseline:
+        return items, next_delta
+
+    return items[:top], next_delta
+
+
+def fetch_messages_since_iso_for_mailbox(mailbox: str, since_iso: str, top: int) -> List[Dict[str, Any]]:
+    url = f"{GRAPH_BASE}/users/{mailbox}/mailFolders/Inbox/messages"
+    params = {
+        "$top": str(top),
+        "$orderby": "receivedDateTime desc",
+        "$filter": f"receivedDateTime ge {since_iso}",
+        "$select": _SELECT_FIELDS,
+    }
+    r = requests.get(url, headers=_headers(), params=params, timeout=60)
+    r.raise_for_status()
+    return (r.json().get("value", []) or [])
+
+
+def to_email_item(raw: Dict[str, Any], mailbox: str) -> Dict[str, Any]:
+    fr = raw.get("from", {}).get("emailAddress", {}) or {}
+    sender = safe_email(fr.get("address", "") or "")
+    sender_name = fr.get("name", "") or ""
+
+    to_list: List[str] = []
+    for x in raw.get("toRecipients", []) or []:
+        addr = (x.get("emailAddress", {}) or {}).get("address", "")
+        if addr:
+            to_list.append(safe_email(addr))
+
+    cc_list: List[str] = []
+    for x in raw.get("ccRecipients", []) or []:
+        addr = (x.get("emailAddress", {}) or {}).get("address", "")
+        if addr:
+            cc_list.append(safe_email(addr))
+
+    body = raw.get("body") or {}
+    content = body.get("content")
+    content_type = body.get("contentType")
+    body_html = content if content_type == "html" else None
+
+    return {
+        "message_id": raw.get("id"),
+        "internet_message_id": raw.get("internetMessageId"),
+        "subject": raw.get("subject"),
+        "sender": sender,
+        "sender_name": sender_name,
+        "to": to_list,
+        "cc": cc_list,
+        "received_datetime": raw.get("receivedDateTime"),
+        "body_preview": raw.get("bodyPreview"),
+        "body_html": body_html,
+        "conversation_id": raw.get("conversationId"),
+        "has_attachments": bool(raw.get("hasAttachments", False)),
+        "mailbox": mailbox,  # store which mailbox this was fetched from (useful later)
+        "raw": raw,  # mysql_ops serializes to string
+    }
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+def prime_delta_cursor_for_mailbox(mailbox: str, top: int = 50) -> str:
+    """
+    Walk the delta feed until Graph returns @odata.deltaLink.
+    We do NOT return/process baseline items. This is purely to get a stable cursor.
+    """
+    url = (
+        f"{GRAPH_BASE}/users/{mailbox}/mailFolders/Inbox/messages/delta"
+        f"?$top={top}&$select=id"
+    )
+
+    while url:
+        r = requests.get(url, headers=_headers(), timeout=60)
+        r.raise_for_status()
+        j = r.json()
+
+        dl = j.get("@odata.deltaLink")
+        if dl:
+            return dl
+
+        url = j.get("@odata.nextLink")
+
+    raise RuntimeError("Delta prime did not return @odata.deltaLink")
+
+
+================================================================================
+app/graph\reply.py:
+
+from __future__ import annotations
+
+import requests
+from typing import Dict, Any, Optional, List
+
+from app.graph.auth import get_graph_token
+
+GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+
+
+def _headers() -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {get_graph_token()}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+
+
+def create_reply_draft(mailbox: str, message_id: str) -> Dict[str, Any]:
+    """
+    Creates a reply draft for an existing message.
+    POST /users/{mailbox}/messages/{message_id}/createReply
+    Returns the draft Message object (includes draft id).
+    """
+    url = f"{GRAPH_BASE}/users/{mailbox}/messages/{message_id}/createReply"
+    r = requests.post(url, headers=_headers(), json={}, timeout=60)
+    r.raise_for_status()
+    return r.json()
+
+
+def update_draft_message(
+    mailbox: str,
+    draft_message_id: str,
+    *,
+    body_html: str,
+    to_recipients: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """
+    PATCH the draft message content (and optionally recipients).
+    """
+    url = f"{GRAPH_BASE}/users/{mailbox}/messages/{draft_message_id}"
+
+    payload: Dict[str, Any] = {
+        "body": {
+            "contentType": "HTML",
+            "content": body_html,
+        }
+    }
+
+    if to_recipients:
+        payload["toRecipients"] = [
+            {"emailAddress": {"address": addr}} for addr in to_recipients if addr
+        ]
+
+    r = requests.patch(url, headers=_headers(), json=payload, timeout=60)
+    r.raise_for_status()
+    return r.json()
+
+def send_draft_message(mailbox: str, draft_message_id: str) -> None:
+    """
+    Sends an existing draft message.
+    POST /users/{mailbox}/messages/{draft_message_id}/send
+    Returns 202 Accepted with empty body.
+    """
+    url = f"{GRAPH_BASE}/users/{mailbox}/messages/{draft_message_id}/send"
+    r = requests.post(url, headers=_headers(), json={}, timeout=60)
+    r.raise_for_status()
+
+
+================================================================================
+app/storage\attachments.py:
+
+from __future__ import annotations
+
+import os
+import re
+import hashlib
+from typing import Optional
+
+
+def _safe_filename(name: str) -> str:
+    name = (name or "attachment.bin").strip().replace("\x00", "")
+    name = re.sub(r"[<>:\"/\\|?*\n\r\t]", "_", name)  # invalid chars on Windows
+    name = re.sub(r"\s+", " ", name).strip()
+    return name or "attachment.bin"
+
+
+def save_file_attachment(
+    mailbox: str,            # kept for interface consistency; not used in path
+    email_id: int,
+    attachment: dict,
+    content_bytes: bytes,
+) -> Optional[str]:
+    attachment_id = (attachment.get("id") or "").strip()
+    filename = _safe_filename(attachment.get("name") or "attachment.bin")
+
+    # Keep filename short to avoid Windows MAX_PATH issues
+    if len(filename) > 120:
+        root, ext = os.path.splitext(filename)
+        filename = root[:110] + ext[:10]
+
+    # Short ID to keep path short and stable
+    short_id = hashlib.md5(attachment_id.encode("utf-8")).hexdigest()[:16] if attachment_id else "unknown"
+
+    # Per-email folder
+    base_dir = os.path.join(os.getcwd(), "storage", "attachments", str(email_id))
+    os.makedirs(base_dir, exist_ok=True)
+
+    # Optional: add a small content hash to avoid overwriting if same short_id repeats
+    content_sig = hashlib.md5(content_bytes).hexdigest()[:8] if content_bytes else "empty"
+
+    path = os.path.join(base_dir, f"{short_id}_{content_sig}_{filename}")
+
+    with open(path, "wb") as f:
+        f.write(content_bytes)
+
+    return path
+
+
+================================================================================
+app/worker\case_watcher.py:
+
+from __future__ import annotations
+
+import os
+import time
+from datetime import datetime, timezone
+from typing import Optional
+
+from dotenv import load_dotenv
+load_dotenv()
+
+from app.mysql_ops import MysqlOps
+from app.core.audit import audit_print
+from app.ai.tasks import draft_reply
+from app.graph.reply import create_reply_draft, update_draft_message
+import html
+
+
+# ---------------------------
+# SLA thresholds (hours)
+# ---------------------------
+SLA_PENDING_STAFFING_HOURS = float(os.getenv("SLA_PENDING_STAFFING_HOURS", "48"))
+SLA_STAFFED_NO_ACCEPTANCE_DRAFT_HOURS = float(os.getenv("SLA_STAFFED_NO_ACCEPTANCE_DRAFT_HOURS", "24"))
+SLA_ACCEPTANCE_DRAFTED_NOT_SENT_HOURS = float(os.getenv("SLA_ACCEPTANCE_DRAFTED_NOT_SENT_HOURS", "24"))
+SLA_EVAL_DONE_NO_AUTH_HOURS = float(os.getenv("SLA_EVAL_DONE_NO_AUTH_HOURS", "72"))
+SLA_AUTH_PENDING_HOURS = float(os.getenv("SLA_AUTH_PENDING_HOURS", "168"))  # 7 days
+
+# Prevent spamming repeated stall events/drafts
+STALL_RENOTIFY_HOURS = float(os.getenv("STALL_RENOTIFY_HOURS", "12"))
+
+# If you want watcher to only log and not create drafts:
+WATCHER_CREATE_DRAFTS = (os.getenv("WATCHER_CREATE_DRAFTS", "1").strip() == "1")
+
+
+from datetime import timezone
+
+def _as_utc_aware(dt: Optional[datetime]) -> Optional[datetime]:
+    if not dt:
+        return None
+    # If naive, assume it's UTC (your DB is effectively UTC-ish)
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+def _hours_since(dt: Optional[datetime]) -> Optional[float]:
+    dt = _as_utc_aware(dt)
+    if not dt:
+        return None
+    delta = _utcnow() - dt
+    return delta.total_seconds() / 3600.0
+
+
+def _ensure_aware_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    if not dt:
+        return None
+    # MySQL often returns naive datetimes; treat them as UTC
+    if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _text_to_simple_html(text: str) -> str:
+    text = (text or "").strip()
+    escaped = html.escape(text)
+    return "<div>" + escaped.replace("\n", "<br>") + "</div>"
+
+
+def _strip_subject_header(draft_text: str) -> str:
+    if not draft_text:
+        return ""
+    lines = draft_text.splitlines()
+    if lines and lines[0].strip().lower().startswith("subject:"):
+        lines = lines[1:]
+        if lines and lines[0].strip() == "":
+            lines = lines[1:]
+    return "\n".join(lines).strip()
+
+
+def _stall_rule(status: str, hours_idle: float) -> Optional[dict]:
+    s = (status or "").strip().lower()
+
+    if s == "pending staffing" and hours_idle >= SLA_PENDING_STAFFING_HOURS:
+        return {"stall_type": "pending_staffing_overdue", "threshold_hours": SLA_PENDING_STAFFING_HOURS}
+
+    if s == "staffed" and hours_idle >= SLA_STAFFED_NO_ACCEPTANCE_DRAFT_HOURS:
+        return {"stall_type": "staffed_no_acceptance_draft", "threshold_hours": SLA_STAFFED_NO_ACCEPTANCE_DRAFT_HOURS}
+
+    if s == "acceptance drafted" and hours_idle >= SLA_ACCEPTANCE_DRAFTED_NOT_SENT_HOURS:
+        return {"stall_type": "acceptance_draft_not_sent", "threshold_hours": SLA_ACCEPTANCE_DRAFTED_NOT_SENT_HOURS}
+
+    if s == "evaluation completed" and hours_idle >= SLA_EVAL_DONE_NO_AUTH_HOURS:
+        return {"stall_type": "eval_done_no_auth", "threshold_hours": SLA_EVAL_DONE_NO_AUTH_HOURS}
+
+    if s == "authorization pending" and hours_idle >= SLA_AUTH_PENDING_HOURS:
+        return {"stall_type": "auth_pending_overdue", "threshold_hours": SLA_AUTH_PENDING_HOURS}
+
+    return None
+
+
+def _should_renotify(ops: MysqlOps, case_id: int, stall_type: str) -> bool:
+    last = ops.get_latest_stall_event(case_id, stall_type)
+    if not last or not last.created_at:
+        return True
+    h = _hours_since(last.created_at)
+    return (h is None) or (h >= STALL_RENOTIFY_HOURS)
+
+
+def _build_followup_instructions(stall_type: str, case_title: str) -> str:
+    # You can tighten/expand these later; keep operational + short.
+    base = f"Context: This is a follow-up about case '{case_title}'.\n"
+
+    if stall_type == "pending_staffing_overdue":
+        return base + (
+            "Write an internal follow-up asking staffing to confirm therapist assignment/availability and next action. "
+            "Ask 1-2 direct questions. Keep it short."
+        )
+
+    if stall_type == "staffed_no_acceptance_draft":
+        return base + (
+            "Write a follow-up asking the team to draft the acceptance email and confirm referral contact details. "
+            "Keep it short."
+        )
+
+    if stall_type == "acceptance_draft_not_sent":
+        return base + (
+            "Write a follow-up reminding that the acceptance draft is ready and needs review/sending. "
+            "Do not claim it was sent. Keep it short."
+        )
+
+    if stall_type == "eval_done_no_auth":
+        return base + (
+            "Write a follow-up asking about authorization next steps and whether any documents are missing. "
+            "Keep it short and operational."
+        )
+
+    if stall_type == "auth_pending_overdue":
+        return base + (
+            "Write a follow-up asking for authorization status update and ETA. "
+            "If missing payer/portal details, ask for them. Keep it short."
+        )
+
+    return base + "Write a short operational follow-up requesting the next step and ETA."
+
+
+def _create_graph_reply_followup_draft(
+    ops: MysqlOps,
+    case_id: int,
+    stall_type: str,
+) -> Optional[int]:
+    """
+    Creates a reply draft (Graph) on the latest email in the case thread.
+    Stores it in drafts table. Returns draft_id or None.
+    """
+    latest_email = ops.get_latest_email_for_case(case_id)
+    if not latest_email:
+        return None
+
+    mailbox = (latest_email.mailbox or "").strip()
+    message_id = (latest_email.message_id or "").strip()
+    if not mailbox or not message_id:
+        return None
+
+    # LLM draft
+    instructions = _build_followup_instructions(stall_type, latest_email.subject or f"Case {case_id}")
+
+    draft_text, model = draft_reply(
+        subject=latest_email.subject or "",
+        sender=latest_email.sender or "",
+        body_html=latest_email.body_html,
+        body_preview=latest_email.body_preview,
+        tone="professional",
+        instructions=instructions,
+    )
+
+    # Graph reply draft object
+    graph_draft = create_reply_draft(mailbox=mailbox, message_id=message_id)
+    graph_draft_id = (graph_draft.get("id") or "").strip()
+    graph_weblink = (graph_draft.get("webLink") or "").strip() if isinstance(graph_draft.get("webLink"), str) else None
+    if not graph_draft_id:
+        return None
+
+    # Update body
+    body_text = _strip_subject_header(draft_text)
+    body_html = _text_to_simple_html(body_text)
+
+    update_draft_message(
+        mailbox=mailbox,
+        draft_message_id=graph_draft_id,
+        body_html=body_html,
+        to_recipients=None,  # keep reply recipients
+    )
+
+    # Store in DB
+    try:
+        draft_id = ops.create_draft(
+            email_id=int(latest_email.id),
+            draft=draft_text,
+            model=model,
+            tone="followup",
+            mailbox=mailbox,
+            graph_draft_message_id=graph_draft_id,
+            graph_draft_web_link=graph_weblink,
+        )
+    except TypeError:
+        draft_id = ops.create_draft(
+            email_id=int(latest_email.id),
+            draft=draft_text,
+            model=model,
+            tone="followup",
+            mailbox=mailbox,
+        )
+
+    # Case event
+    if not ops.case_event_exists_any(case_id=case_id, email_id=int(latest_email.id), event_type="followup_draft_created"):
+        ops.create_case_event(
+            case_id=case_id,
+            email_id=int(latest_email.id),
+            event_type="followup_draft_created",
+            actor="ai",
+            payload={
+                "stall_type": stall_type,
+                "draft_id": draft_id,
+                "mailbox": mailbox,
+                "graph_draft_message_id": graph_draft_id,
+                "graph_draft_web_link": graph_weblink,
+            },
+        )
+
+    return draft_id
+
+
+def run_once() -> dict:
+    ops = MysqlOps()
+    cases = ops.list_active_cases(limit=int(os.getenv("WATCHER_CASE_LIMIT", "500")))
+
+    scanned = 0
+    stalled = 0
+    drafts_created = 0
+
+    for c in cases:
+        scanned += 1
+
+        # If no meaningful events exist, use case.updated_at as fallback.
+        last_evt = ops.get_latest_meaningful_event(int(c.id))
+        last_dt = last_evt.created_at if (last_evt and last_evt.created_at) else c.updated_at
+        hours_idle = _hours_since(last_dt)
+
+        if hours_idle is None:
+            continue
+
+        rule = _stall_rule(c.status, hours_idle)
+        if not rule:
+            continue
+
+        # dedupe spam
+        if not _should_renotify(ops, int(c.id), rule["stall_type"]):
+            continue
+
+        stalled += 1
+
+        # Log stall
+        ops.create_case_event(
+            case_id=int(c.id),
+            email_id=None,
+            event_type="stall_detected",
+            actor="ai",
+            payload={
+                "case_status": c.status,
+                "stall_type": rule["stall_type"],
+                "threshold_hours": rule["threshold_hours"],
+                "hours_idle": round(hours_idle, 2),
+                "last_event_type": getattr(last_evt, "event_type", None) if last_evt else None,
+                "last_event_at": last_dt.isoformat() if last_dt else None,
+            },
+        )
+
+        # Optional follow-up draft
+        if WATCHER_CREATE_DRAFTS:
+            try:
+                did = _create_graph_reply_followup_draft(ops, int(c.id), rule["stall_type"])
+                if did:
+                    drafts_created += 1
+            except Exception as e:
+                audit_print(
+                    "case_watcher.draft_error",
+                    {"case_id": int(c.id), "error": str(e), "stall_type": rule["stall_type"]},
+                )
+
+    out = {"scanned": scanned, "stalled": stalled, "drafts_created": drafts_created}
+    audit_print("case_watcher.run_once", out)
+    return out
+
+
+def run_forever() -> None:
+    interval = int(os.getenv("WATCHER_INTERVAL_SECONDS", "1800"))  # default 30 minutes
+    while True:
+        try:
+            run_once()
+        except Exception as e:
+            audit_print("case_watcher.error", {"error": str(e)})
+        time.sleep(interval)
+
+
+if __name__ == "__main__":
+    run_forever()
+
+
+================================================================================
+app/worker\poller.py:
+
+from __future__ import annotations
+
+import os
+import time
+import base64
+from datetime import datetime, timedelta, timezone
+
+from dotenv import load_dotenv
+load_dotenv()
+
+from app.core.audit import audit_print
+from app.graph.mail import (
+    fetch_messages_delta_for_mailbox,
+    fetch_messages_since_iso_for_mailbox,
+    prime_delta_cursor_for_mailbox,
+    to_email_item,
+    now_iso,
+)
+
+from app.graph.attachments import fetch_attachments
+from app.storage.attachments import save_file_attachment
+from app.mysql_ops import MysqlOps
+from app.ai.tasks import process_email_llm
+from app.core.intent_rules import can_apply_intent, status_for_intent
+from app.core.status_rules import normalize_status
+
+
+def _parse_graph_dt(dt_str: str | None):
+    if not dt_str:
+        return None
+    try:
+        if dt_str.endswith("Z"):
+            dt_str = dt_str.replace("Z", "+00:00")
+        return datetime.fromisoformat(dt_str)
+    except Exception:
+        return None
+
+
+def _is_image_attachment(a: dict) -> bool:
+    ct = (a.get("contentType") or "").lower()
+    name = (a.get("name") or "").lower()
+    return ct.startswith("image/") or name.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico"))
+
+
+def _should_skip_noise(a: dict, min_image_bytes: int) -> tuple[bool, str]:
+    if a.get("isInline") or a.get("contentId"):
+        return True, "inline"
+
+    if _is_image_attachment(a):
+        size = int(a.get("size") or 0)
+        if size and size < min_image_bytes:
+            return True, f"small_image<{min_image_bytes}"
+
+    return False, ""
+
+
+def _get_mailboxes() -> list[str]:
+    mailboxes = os.getenv("MAILBOXES", "").strip()
+    if mailboxes:
+        return [m.strip() for m in mailboxes.split(",") if m.strip()]
+    single = os.getenv("MS_USER_ID", "").strip()
+    if single:
+        return [single]
+    return []
+
+
+def _try_process_attachments(
+    ops: MysqlOps,
+    mailbox: str,
+    email_id: int,
+    graph_message_id: str,
+) -> dict:
+    stats = {
+        "count": 0,
+        "saved_files": 0,
+        "saved_meta": 0,
+        "skipped_inline": 0,
+        "skipped_no_bytes": 0,
+        "errors": 0,
+    }
+
+    try:
+        atts = fetch_attachments(mailbox, graph_message_id)
+    except Exception as e:
+        audit_print(
+            "poller.attachments_fetch_error",
+            {"mailbox": mailbox, "email_id": email_id, "message_id": graph_message_id, "error": str(e)},
+        )
+        stats["errors"] += 1
+        return stats
+
+    stats["count"] = len(atts)
+    min_image_bytes = int(os.getenv("MIN_IMAGE_ATTACHMENT_BYTES", "102400"))
+
+    for a in atts:
+        try:
+            local_path = None
+
+            skip, reason = _should_skip_noise(a, min_image_bytes=min_image_bytes)
+            if skip:
+                ops.upsert_email_attachment(email_id, a, None)
+                stats["saved_meta"] += 1
+                if reason == "inline":
+                    stats["skipped_inline"] += 1
+                else:
+                    stats.setdefault("skipped_other", 0)
+                    stats["skipped_other"] += 1
+                continue
+
+            if a.get("@odata.type") == "#microsoft.graph.fileAttachment":
+                content_b64 = a.get("contentBytes")
+                if not content_b64:
+                    ops.upsert_email_attachment(email_id, a, None)
+                    stats["saved_meta"] += 1
+                    stats["skipped_no_bytes"] += 1
+                    continue
+
+                content_bytes = base64.b64decode("".join(str(content_b64).split()), validate=False)
+
+                local_path = save_file_attachment(
+                    mailbox=mailbox,
+                    email_id=email_id,
+                    attachment=a,
+                    content_bytes=content_bytes,
+                )
+                stats["saved_files"] += 1
+
+            ops.upsert_email_attachment(email_id, a, local_path)
+            stats["saved_meta"] += 1
+
+        except Exception as e:
+            stats["errors"] += 1
+            audit_print(
+                "poller.attachment_process_error",
+                {"mailbox": mailbox, "email_id": email_id, "attachment_id": a.get("id"), "error": str(e)},
+            )
+
+    return stats
+
+
+def _normalize_pred_intent(llm_out: dict) -> tuple[str, float, str | None]:
+    pred_intent = (llm_out.get("intent") or "").strip()
+    try:
+        confidence = float(llm_out.get("confidence") or 0.0)
+    except Exception:
+        confidence = 0.0
+    recommended_status = llm_out.get("recommended_status")
+
+    # normalize recommended_status
+    if isinstance(recommended_status, str):
+        rs = recommended_status.strip()
+        if rs.lower() == "new":
+            recommended_status = None
+        else:
+            recommended_status = rs
+
+    # never apply status for noise intents
+    if pred_intent in {"non_case_email", "unknown", ""}:
+        recommended_status = None
+
+    return pred_intent, confidence, recommended_status
+
+
+def run_once_for_mailbox(mailbox: str) -> dict:
+    ops = MysqlOps()
+    state = ops.get_sync_state(mailbox)
+    delta_link = state.delta_link if state else None
+    last_sync_iso = state.last_sync_iso if state else None
+
+    limit = int(os.getenv("GRAPH_FETCH_LIMIT", "10"))
+
+    msgs = []
+    new_delta = None
+
+    if delta_link:
+        msgs, new_delta = fetch_messages_delta_for_mailbox(mailbox, delta_link, top=limit)
+        mode = "delta"
+    elif last_sync_iso:
+        msgs = fetch_messages_since_iso_for_mailbox(mailbox, since_iso=last_sync_iso, top=limit)
+        mode = "since"
+    else:
+        # BASELINE (first ever run):
+        # 1) Prime delta cursor WITHOUT ingesting historical emails
+        new_delta = prime_delta_cursor_for_mailbox(mailbox)
+        mode = "delta_primed"
+
+        # 2) Optionally ingest only recent emails once (recommended)
+        lookback_hours = int(os.getenv("BASELINE_LOOKBACK_HOURS", "72"))
+        ingest_recent = (os.getenv("BASELINE_INGEST_RECENT", "1").strip().lower() not in {"0", "false", "no"})
+
+        if ingest_recent and lookback_hours > 0:
+            since_dt = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+            since_iso = since_dt.isoformat().replace("+00:00", "Z")
+            msgs = fetch_messages_since_iso_for_mailbox(mailbox, since_iso=since_iso, top=limit)
+            mode = f"delta_primed+since_{lookback_hours}h"
+        else:
+            msgs = []
+
+    saved = 0
+    attachments_total = 0
+    attachments_saved_files = 0
+    attachments_saved_meta = 0
+    attachments_errors = 0
+
+    # default lowered because your outputs are often 0.62–0.72
+    min_conf = float(os.getenv("INTENT_MIN_CONFIDENCE", "0.65"))
+
+    for raw in msgs:
+        if raw.get("@removed"):
+            continue
+
+        email = to_email_item(raw, mailbox)
+
+        # 1) Save email
+        email_id = ops.upsert_email(email)
+
+        # 1.1) Persist received_at
+        received_at = _parse_graph_dt(email.get("received_datetime"))
+        if received_at:
+            ops.set_email_received_at(int(email_id), received_at)
+
+        # 2) Mailbox-scoped case key
+        conversation_id = (email.get("conversation_id") or "").strip()
+        case_external_id = f"{mailbox}:{conversation_id}" if conversation_id else f"{mailbox}:email:{email_id}"
+
+        # 3) Create/get case and link email->case
+        case_id = ops.get_or_create_case_by_external_id(
+            external_id=case_external_id,
+            title=email.get("subject") or "(no subject)",
+            metadata={"mailbox": mailbox, "conversation_id": conversation_id, "seed_email_id": int(email_id)},
+        )
+        ops.set_email_case_id(int(email_id), int(case_id))
+        saved += 1
+
+        # 4) Attachments (store them first, no extraction)
+        if email.get("has_attachments") and email.get("message_id") and email_id:
+            st = _try_process_attachments(
+                ops=ops,
+                mailbox=mailbox,
+                email_id=int(email_id),
+                graph_message_id=str(email["message_id"]),
+            )
+            attachments_total += st["count"]
+            attachments_saved_files += st["saved_files"]
+            attachments_saved_meta += st["saved_meta"]
+            attachments_errors += st["errors"]
+
+        # 5) Build attachment list from DB (metadata only)
+        atts_for_email = ops.list_attachments_for_email(int(email_id))
+        att_payload = [
+            {
+                "id": a.id,
+                "attachment_id": a.attachment_id,
+                "name": a.name,
+                "content_type": a.content_type,
+                "size": a.size,
+                "is_inline": bool(a.is_inline),
+                "content_id": a.content_id,
+                "local_path": a.local_path,
+                "openai_file_id": getattr(a, "openai_file_id", None),
+            }
+            for a in atts_for_email
+        ]
+
+        # 6) ALWAYS run LLM processing (classification + extraction)
+        llm_out = None
+        llm_model = None
+        try:
+            llm_out, llm_model = process_email_llm(
+                mailbox=mailbox,
+                subject=email.get("subject"),
+                sender=email.get("sender"),
+                body_html=email.get("body_html"),
+                body_preview=email.get("body_preview"),
+                attachments=att_payload,
+            )
+        except Exception as e:
+            audit_print(
+                "poller.llm_process_error",
+                {"mailbox": mailbox, "email_id": int(email_id), "case_id": int(case_id), "error": str(e)},
+            )
+            llm_out = {
+                "intent": "unknown",
+                "confidence": 0.0,
+                "signals": ["llm_failed"],
+                "extracted": None,
+                "recommended_status": None,
+            }
+            llm_model = os.getenv("OPENAI_MODEL", "gpt-5-nano")
+
+        # 7) Always log LLM output (single canonical event per email)
+        if not ops.case_event_exists_any(case_id=int(case_id), email_id=int(email_id), event_type="llm_processed"):
+            ops.create_case_event(
+                case_id=int(case_id),
+                email_id=int(email_id),
+                event_type="llm_processed",
+                actor="ai",
+                payload={
+                    "model": llm_model,
+                    "min_confidence": min_conf,
+                    "mailbox": mailbox,
+                    "subject": email.get("subject"),
+                    "sender": email.get("sender"),
+                    "llm": llm_out,
+                },
+            )
+
+        # 7.1) NEW: Also log a milestone event (intent) so case_watcher can find "meaningful" events.
+        pred_intent, confidence, recommended_status = _normalize_pred_intent(llm_out)
+
+        if pred_intent and pred_intent not in {"non_case_email", "unknown"} and confidence >= min_conf:
+            if not ops.case_event_exists_any(case_id=int(case_id), email_id=int(email_id), event_type=pred_intent):
+                ops.create_case_event(
+                    case_id=int(case_id),
+                    email_id=int(email_id),
+                    event_type=pred_intent,
+                    actor="ai",
+                    payload={
+                        "model": llm_model,
+                        "confidence": confidence,
+                        "mailbox": mailbox,
+                        "subject": email.get("subject"),
+                        "sender": email.get("sender"),
+                    },
+                )
+
+        # 8) Apply status transition if confident (ignore "new", noise intents, mapping priority)
+        case_row = ops.get_case_by_id(int(case_id))
+        current_status = case_row.status if case_row else None
+
+        if pred_intent and pred_intent not in {"non_case_email", "unknown"} and confidence >= min_conf:
+            mapped = None
+            if can_apply_intent(current_status, pred_intent):
+                mapped = status_for_intent(pred_intent)
+
+            if mapped:
+                # If model status matches mapping, ok; if conflicts, ignore model and use mapping
+                if isinstance(recommended_status, str) and normalize_status(recommended_status) == normalize_status(mapped):
+                    ops.update_case(int(case_id), {"status": normalize_status(recommended_status)})
+                else:
+                    ops.update_case(int(case_id), {"status": mapped})
+            else:
+                # No mapping available -> only then try recommended_status if non-"new"
+                if isinstance(recommended_status, str) and recommended_status.strip():
+                    new_status = normalize_status(recommended_status.strip())
+                    if new_status != "new":
+                        ops.update_case(int(case_id), {"status": new_status})
+
+        # 9) Merge extracted data (if any) into case metadata
+        extracted = llm_out.get("extracted")
+        if isinstance(extracted, dict) and extracted:
+            ops.merge_case_metadata(int(case_id), {"extracted": extracted})
+
+    ops.upsert_sync_state(mailbox, new_delta or delta_link, now_iso())
+
+    audit_print(
+        "poller.run_once",
+        {
+            "mailbox": mailbox,
+            "mode": mode,
+            "fetched": len(msgs),
+            "saved": saved,
+            "has_new_delta": bool(new_delta and new_delta != delta_link),
+            "attachments_total": attachments_total,
+            "attachments_saved_files": attachments_saved_files,
+            "attachments_saved_meta": attachments_saved_meta,
+            "attachments_errors": attachments_errors,
+        },
+    )
+
+    return {
+        "mailbox": mailbox,
+        "mode": mode,
+        "fetched": len(msgs),
+        "saved": saved,
+        "has_new_delta": bool(new_delta and new_delta != delta_link),
+        "attachments_total": attachments_total,
+        "attachments_saved_files": attachments_saved_files,
+        "attachments_saved_meta": attachments_saved_meta,
+        "attachments_errors": attachments_errors,
+    }
+
+
+def run_once() -> dict:
+    mailboxes = _get_mailboxes()
+    if not mailboxes:
+        raise RuntimeError("No mailbox configured. Set MAILBOXES or MS_USER_ID in .env")
+
+    results = []
+    for m in mailboxes:
+        try:
+            results.append(run_once_for_mailbox(m))
+        except Exception as e:
+            audit_print("poller.mailbox_error", {"mailbox": m, "error": str(e)})
+    return {"items": results}
+
+
+def run_forever() -> None:
+    interval = int(os.getenv("POLL_INTERVAL_SECONDS", "30"))
+    while True:
+        try:
+            run_once()
+        except Exception as e:
+            audit_print("poller.error", {"error": str(e)})
+        time.sleep(interval)
+
+
+if __name__ == "__main__":
+    run_forever()
