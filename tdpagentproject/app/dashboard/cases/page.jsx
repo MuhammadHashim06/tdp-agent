@@ -214,8 +214,8 @@ export default function CasesListPage() {
                                 key={tab}
                                 onClick={() => setActiveTab(tab)}
                                 className={`px-3 py-1.5 text-xs font-medium rounded-full transition-all border ${activeTab === tab
-                                        ? 'bg-indigo-50 border-indigo-200 text-indigo-700 dark:bg-indigo-900/30 dark:border-indigo-800 dark:text-indigo-300 shadow-sm'
-                                        : 'bg-transparent border-transparent text-gray-500 hover:bg-gray-50 hover:text-gray-700 dark:hover:bg-zinc-800 dark:text-gray-400'
+                                    ? 'bg-indigo-50 border-indigo-200 text-indigo-700 dark:bg-indigo-900/30 dark:border-indigo-800 dark:text-indigo-300 shadow-sm'
+                                    : 'bg-transparent border-transparent text-gray-500 hover:bg-gray-50 hover:text-gray-700 dark:hover:bg-zinc-800 dark:text-gray-400'
                                     }`}
                             >
                                 {tab}
@@ -256,7 +256,13 @@ export default function CasesListPage() {
                             {filteredCases.map((item) => (
                                 <tr key={item.id} className="hover:bg-gray-50 dark:hover:bg-zinc-800/50 transition-colors group">
                                     <td className="px-4 py-3 text-sm text-gray-500 dark:text-gray-400 align-top">
-                                        <span className="font-mono text-xs">{formatCaseId(item.id)}</span>
+
+                                        {/* <span className="font-mono text-xs">{formatCaseId(item.id)}</span> */}
+                                        <div className="break-words line-clamp-2" title={item.title}>
+                                            <Link href={`/dashboard/cases/${item.id}`} className="hover:text-indigo-600 dark:hover:text-indigo-400">
+                                                {formatCaseId(item.id)}
+                                            </Link>
+                                        </div>
                                     </td>
                                     <td className="px-4 py-3 text-sm font-medium text-gray-900 dark:text-white align-top max-w-[200px]">
                                         <div className="break-words line-clamp-2" title={item.title}>

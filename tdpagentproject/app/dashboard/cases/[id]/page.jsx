@@ -25,6 +25,10 @@ export default function CaseDetailPage(props) {
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
 
+    // Linked Data State
+    const [linkedEmail, setLinkedEmail] = useState(null);
+    const [linkedDrafts, setLinkedDrafts] = useState([]);
+
     // Modal State
     const [isStaffingModalOpen, setIsStaffingModalOpen] = useState(false);
     const [staffingFormData, setStaffingFormData] = useState({
@@ -43,6 +47,9 @@ export default function CaseDetailPage(props) {
         status: '',
         title: ''
     });
+
+    // Payload Viewer State
+    const [viewingPayload, setViewingPayload] = useState(null);
 
     useEffect(() => {
         if (id) {
@@ -68,6 +75,23 @@ export default function CaseDetailPage(props) {
 
             if (caseData) {
                 setCaseDetail(caseData);
+
+                // Fetch linked data if seed_email_id exists
+                if (caseData.metadata?.seed_email_id) {
+                    // Fetch Email
+                    api.getEmailById(caseData.metadata.seed_email_id)
+                        .then(data => setLinkedEmail(data))
+                        .catch(e => console.warn('Failed to fetch linked email', e));
+
+                    // Fetch Drafts
+                    api.getDraftsByEmailId(caseData.metadata.seed_email_id)
+                        .then(data => {
+                            // Handle potential different response structures (array or object with items)
+                            const items = Array.isArray(data) ? data : data.items || data || [];
+                            setLinkedDrafts(items);
+                        })
+                        .catch(e => console.warn('Failed to fetch linked drafts', e));
+                }
             } else {
                 // Fallback mock data matching User Request (Case ID 6)
                 setCaseDetail({
@@ -449,34 +473,42 @@ export default function CaseDetailPage(props) {
                             <h3 className="text-sm font-semibold text-gray-500 uppercase tracking-wider">Emails</h3>
                         </div>
                         <div className="divide-y divide-gray-100 dark:divide-zinc-800">
-                            {/* Mock Email Item */}
-                            <div className="p-4 hover:bg-gray-50 dark:hover:bg-zinc-800/50 transition-colors">
-                                <div className="flex justify-between items-start mb-1">
-                                    <div className="flex items-center gap-2">
-                                        <div className="h-8 w-8 rounded-full bg-indigo-100 flex items-center justify-center text-indigo-600 font-semibold text-xs">
-                                            {getInitials(caseDetail.metadata?.extracted?.referral_source_name || "Unknown")}
+                            {linkedEmail ? (
+                                <div className="p-4 hover:bg-gray-50 dark:hover:bg-zinc-800/50 transition-colors cursor-pointer">
+                                    <Link href={`/dashboard/email/${linkedEmail.id}`} className="block">
+                                        <div className="flex justify-between items-start mb-1">
+                                            <div className="flex items-center gap-2">
+                                                <div className="h-8 w-8 rounded-full bg-indigo-100 flex items-center justify-center text-indigo-600 font-semibold text-xs">
+                                                    {getInitials(linkedEmail.sender_name || linkedEmail.sender || "Unknown")}
+                                                </div>
+                                                <div>
+                                                    <p className="text-sm font-medium text-gray-900 dark:text-white truncate max-w-[200px]" title={linkedEmail.subject}>
+                                                        email{linkedEmail.id}
+                                                    </p>
+                                                    <p className="text-xs text-gray-500 truncate max-w-[200px]">
+                                                        {linkedEmail.sender} &rarr; Me
+                                                    </p>
+                                                </div>
+                                            </div>
+                                            <span className="text-xs text-gray-400 shrink-0">
+                                                {new Date(linkedEmail.received_datetime).toLocaleDateString()}
+                                            </span>
                                         </div>
-                                        <div>
-                                            <p className="text-sm font-medium text-gray-900 dark:text-white">
-                                                {caseDetail.title}
-                                            </p>
-                                            <p className="text-xs text-gray-500">
-                                                {caseDetail.metadata?.extracted?.referral_source_email} &rarr; staffing@therapydepotonline.com
-                                            </p>
+                                        <p className="text-sm text-gray-600 dark:text-gray-300 mt-2 line-clamp-2 pl-10">
+                                            {linkedEmail.body_preview || linkedEmail.subject || "No preview available"}
+                                        </p>
+                                        <div className="pl-10 mt-2 flex gap-2">
+                                            <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-gray-100 text-gray-800">
+                                                Original Request
+                                            </span>
                                         </div>
-                                    </div>
-                                    <span className="text-xs text-gray-400">12/22/2025</span>
+                                    </Link>
                                 </div>
-                                <p className="text-sm text-gray-600 dark:text-gray-300 mt-2 line-clamp-2 pl-10">
-                                    {/* Snippet from extraction evidence or default */}
-                                    Please find attached the referral documents...
-                                </p>
-                                <div className="pl-10 mt-2">
-                                    <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-gray-100 text-gray-800">
-                                        📎 1 attachment(s)
-                                    </span>
-                                </div>
-                            </div>
+                            ) : caseDetail.metadata?.seed_email_id ? (
+                                <div className="p-4 text-center text-gray-400 text-sm animate-pulse">Loading email...</div>
+                            ) : (
+                                <div className="p-4 text-center text-gray-500 text-sm">No linked emails</div>
+                            )}
                         </div>
                     </div>
 
@@ -490,34 +522,52 @@ export default function CaseDetailPage(props) {
                                 <table className="min-w-full text-left text-sm">
                                     <thead>
                                         <tr className="text-xs text-gray-400 uppercase border-b border-gray-100 dark:border-zinc-800">
+                                            <th className="pb-2 font-medium">ID</th>
                                             <th className="pb-2 font-medium">Type</th>
                                             <th className="pb-2 font-medium">Status</th>
-                                            <th className="pb-2 font-medium">Details</th>
-                                            <th className="pb-2 font-medium text-right">Date</th>
-                                            <th className="pb-2"></th>
+                                            <th className="pb-2 font-medium text-right">Action</th>
                                         </tr>
                                     </thead>
                                     <tbody className="divide-y divide-gray-100 dark:divide-zinc-800">
-                                        <tr>
-                                            <td className="py-3">
-                                                <div className="flex items-center gap-2">
-                                                    <div className="h-2 w-2 rounded-full bg-yellow-400"></div>
-                                                    <span className="font-medium text-gray-900 dark:text-white">Acceptance</span>
-                                                </div>
-                                            </td>
-                                            <td className="py-3">
-                                                <span className="px-2 py-0.5 bg-gray-100 text-gray-600 rounded-full text-xs">drafted</span>
-                                            </td>
-                                            <td className="py-3 text-xs text-gray-500">
-                                                To: {caseDetail.metadata?.extracted?.referral_source_email || '...'}
-                                            </td>
-                                            <td className="py-3 text-right text-xs text-gray-500">
-                                                12/23/2025
-                                            </td>
-                                            <td className="py-3 text-right">
-                                                <button className="text-indigo-600 hover:text-indigo-800 text-xs font-medium">Open ↗</button>
-                                            </td>
-                                        </tr>
+                                        {linkedDrafts.length > 0 ? (
+                                            linkedDrafts.map(draft => (
+                                                <tr key={draft.id}>
+                                                    <td className="py-3 font-medium text-gray-900 dark:text-white">
+                                                        draft{draft.id}
+                                                    </td>
+                                                    <td className="py-3">
+                                                        <div className="flex items-center gap-2">
+                                                            <div className={`h-2 w-2 rounded-full ${draft.status === 'sent' ? 'bg-green-400' : 'bg-yellow-400'}`}></div>
+                                                            <span className="capitalize">{draft.kind || 'Draft'}</span>
+                                                        </div>
+                                                    </td>
+                                                    <td className="py-3">
+                                                        <span className={`px-2 py-0.5 rounded-full text-xs font-medium capitalize ${draft.status === 'sent' ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-600'}`}>
+                                                            {draft.status || 'Draft'}
+                                                        </span>
+                                                    </td>
+                                                    <td className="py-3 text-right">
+                                                        <Link href={`/dashboard/draft/${draft.id}`} className="text-indigo-600 hover:text-indigo-800 text-xs font-medium">
+                                                            Open ↗
+                                                        </Link>
+                                                    </td>
+                                                </tr>
+                                            ))
+                                        ) : caseDetail.metadata?.seed_email_id ? (
+                                            // Ensure we show something if loading or if truly empty but seed exists
+                                            // The user request implied there WILL be data, but in reality it might be empty.
+                                            // We'll optimistically show "No drafts" if array is empty after load, 
+                                            // but maybe we can check if we are loading drafts?
+                                            // Since we didn't add a loading state specific to drafts, this will show No Drafts initially or update fast.
+                                            // Let's just show standard Empty state.
+                                            <tr>
+                                                <td colSpan="4" className="py-3 text-center text-gray-500 text-xs">No drafts found for this case.</td>
+                                            </tr>
+                                        ) : (
+                                            <tr>
+                                                <td colSpan="4" className="py-3 text-center text-gray-500">No linked drafts</td>
+                                            </tr>
+                                        )}
                                     </tbody>
                                 </table>
                             </div>
@@ -549,11 +599,14 @@ export default function CaseDetailPage(props) {
                                                 </div>
                                             )}
                                             <p className="text-sm text-gray-500 mt-1">
-                                                {item.body_preview}
+                                                {item.body_preview} ....
                                             </p>
-                                            <button className="text-xs text-gray-400 hover:text-gray-600 mt-1 flex items-center gap-1">
+                                            {/* <button
+                                                onClick={() => setViewingPayload(item)}
+                                                className="text-xs text-gray-400 hover:text-gray-600 mt-1 flex items-center gap-1"
+                                            >
                                                 › View Payload
-                                            </button>
+                                            </button> */}
                                         </div>
                                     </div>
                                 ))}
@@ -643,6 +696,65 @@ export default function CaseDetailPage(props) {
                                 </button>
                             </div>
                         </form>
+                    </div>
+                </div>
+            )}
+
+            {/* Payload Modal */}
+            {viewingPayload && (
+                <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+                    <div className="bg-white dark:bg-zinc-900 rounded-lg shadow-xl max-w-2xl w-full p-6 max-h-[80vh] flex flex-col">
+                        <div className="flex justify-between items-center mb-6 pb-4 border-b border-gray-100 dark:border-zinc-800">
+                            <div>
+                                <h2 className="text-lg font-bold text-gray-900 dark:text-white">Event Details</h2>
+                                <p className="text-xs text-gray-500 uppercase tracking-wider mt-1">{viewingPayload.subject}</p>
+                            </div>
+                            <button onClick={() => setViewingPayload(null)} className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-200">
+                                <span className="sr-only">Close</span>
+                                <svg className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                                </svg>
+                            </button>
+                        </div>
+
+                        <div className="overflow-auto flex-1 pr-2">
+                            <div className="grid grid-cols-1 gap-4">
+                                {Object.entries(viewingPayload).map(([key, value]) => {
+                                    if (key === 'id' || key === 'subject') return null; // Skip redundant fields
+
+                                    let displayValue = value;
+                                    if (typeof value === 'object' && value !== null) {
+                                        displayValue = (
+                                            <pre className="bg-gray-50 dark:bg-zinc-800 p-3 rounded text-xs font-mono overflow-x-auto text-gray-600 dark:text-gray-300">
+                                                {JSON.stringify(value, null, 2)}
+                                            </pre>
+                                        );
+                                    } else if (key.includes('datetime') || key.includes('date')) {
+                                        displayValue = new Date(value).toLocaleString();
+                                    }
+
+                                    return (
+                                        <div key={key} className="group">
+                                            <p className="text-xs font-medium text-gray-400 uppercase tracking-wide mb-1">
+                                                {key.replace(/_/g, ' ')}
+                                            </p>
+                                            <div className="text-sm text-gray-900 dark:text-white font-medium bg-gray-50 dark:bg-zinc-800/50 p-3 rounded border border-gray-100 dark:border-zinc-800 group-hover:border-indigo-100 dark:group-hover:border-indigo-900/30 transition-colors">
+                                                {displayValue || <span className="text-gray-400 italic">None</span>}
+                                            </div>
+                                        </div>
+                                    );
+                                })}
+                            </div>
+                        </div>
+
+                        <div className="flex justify-end pt-6 mt-2 border-t border-gray-100 dark:border-zinc-800">
+                            <button
+                                onClick={() => setViewingPayload(null)}
+                                className="px-5 py-2 bg-indigo-600 text-white rounded-lg text-sm font-medium hover:bg-indigo-700 shadow-sm shadow-indigo-200 dark:shadow-none transition-all"
+                            >
+                                Done
+                            </button>
+                        </div>
                     </div>
                 </div>
             )}

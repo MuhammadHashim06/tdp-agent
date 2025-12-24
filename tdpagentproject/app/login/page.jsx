@@ -75,12 +75,12 @@ export default function LoginPage() {
                     </div>
                 </form>
                 <div className="text-center text-sm">
-                    <p className="text-gray-200">
+                    {/* <p className="text-gray-200">
                         Don't have an account?{' '}
                         <Link href="/signup" className="font-semibold text-white hover:text-indigo-100 underline decoration-indigo-200 underline-offset-4">
                             Sign up
                         </Link>
-                    </p>
+                    </p> */}
                     {/* <div className="mt-4 p-2 rounded bg-black/20 text-xs text-gray-300 inline-block">
                         Test with: <strong>user@example.com</strong> / <strong>password</strong>
                     </div> */}
