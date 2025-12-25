@@ -9,6 +9,7 @@ from app.api.drafts import router as drafts_router
 from app.api.emails import router as emails_router
 from app.api.attachments import router as attachments_router
 from app.api.notification import router as notifications_router
+from app.api.notes import router as notes_router
 
 def create_app() -> FastAPI:
     app = FastAPI(title=os.getenv("APP_NAME", "TdpAgent"))
@@ -30,6 +31,7 @@ def create_app() -> FastAPI:
     app.include_router(emails_router, prefix="/api/emails", tags=["emails"])
     app.include_router(attachments_router, prefix="/api/attachments", tags=["attachments"])
     app.include_router(notifications_router, prefix="/api/notifications", tags=["notifications"])
+    app.include_router(notes_router, prefix="/api/notes", tags=["notes"])
     return app
 
 app = create_app()

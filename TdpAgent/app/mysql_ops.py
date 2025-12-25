@@ -715,7 +715,7 @@ from sqlalchemy import select
 from sqlalchemy import or_
 
 from app.db import SessionLocal
-from app.models import Email, SyncState, Case, Draft, EmailAttachment, CaseEvent
+from app.models import Email, SyncState, Case, Draft, EmailAttachment, CaseEvent, Note
 
 import json
 from datetime import datetime, time, timedelta, timezone
@@ -1397,3 +1397,67 @@ class MysqlOps:
                 })
 
         return stalled_cases
+    
+    def create_note(
+        self,
+        case_id: int,
+        source: Optional[str],
+        detail: str,
+        date: Optional[datetime] = None,
+    ) -> int:
+        """
+        Create a new note.
+        """
+        with SessionLocal() as db:
+            row = Note(
+                case_id=case_id,
+                source=source,
+                detail=detail,
+                date=date or datetime.now(timezone.utc),  # Default to current UTC time
+            )
+            db.add(row)
+            db.commit()
+            db.refresh(row)
+            return row.id
+    def get_note_by_id(self, note_id: int) -> Optional[Note]:
+        """
+        Fetch a note by its ID.
+        """
+        with SessionLocal() as db:
+            return db.get(Note, note_id)
+    def list_notes_for_case(self, case_id: int, limit: int = 50) -> List[Note]:
+        """
+        Fetch all notes for a specific case.
+        """
+        with SessionLocal() as db:
+            return list(
+                db.scalars(
+                    select(Note)
+                    .where(Note.case_id == case_id)
+                    .order_by(Note.date.desc())
+                    .limit(limit)
+                )
+            )
+    def update_note(
+        self, note_id: int, fields: Dict[str, Any]
+    ) -> None:
+        """
+        Update a specific note.
+        """
+        with SessionLocal() as db:
+            row = db.get(Note, note_id)
+            if not row:
+                raise ValueError("Note not found")
+            for k, v in fields.items():
+                setattr(row, k, v)
+            db.commit()
+    def delete_note(self, note_id: int) -> None:
+        """
+        Delete a note by its ID.
+        """
+        with SessionLocal() as db:
+            row = db.get(Note, note_id)
+            if not row:
+                raise ValueError("Note not found")
+            db.delete(row)
+            db.commit()

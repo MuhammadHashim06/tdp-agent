@@ -3,7 +3,7 @@
 import { useState, useEffect, use } from 'react';
 import Link from 'next/link';
 import { api } from '../../../../lib/api';
-import { ArrowUp, ArrowUpRight, ArrowUpRightSquareIcon } from 'lucide-react';
+import { ArrowUp, ArrowUpRight, ArrowUpRightSquareIcon, Trash2, Plus, Pencil } from 'lucide-react';
 
 const ALLOWED_STATUSES_DEFAULT = [
     "new",
@@ -52,11 +52,86 @@ export default function CaseDetailPage(props) {
     // Payload Viewer State
     const [viewingPayload, setViewingPayload] = useState(null);
 
+    // Notes State
+    const [notes, setNotes] = useState([]);
+    const [isNoteModalOpen, setIsNoteModalOpen] = useState(false);
+    const [newNoteDetail, setNewNoteDetail] = useState('');
+    const [newNoteSource, setNewNoteSource] = useState('web');
+    const [newNoteDate, setNewNoteDate] = useState('');
+    const [editingNote, setEditingNote] = useState(null);
+
     useEffect(() => {
         if (id) {
             fetchCaseData(id);
+            fetchNotes(id);
         }
     }, [id]);
+
+    const fetchNotes = async (caseId) => {
+        try {
+            const data = await api.getNotesByCaseId(caseId);
+            setNotes(data.items || data || []);
+        } catch (err) {
+            console.warn('Failed to fetch notes', err);
+        }
+    };
+
+    const handleSaveNote = async (e) => {
+        e.preventDefault();
+        if (!newNoteDetail.trim()) return;
+
+        setIsSubmitting(true);
+        try {
+            const noteData = {
+                case_id: parseInt(id),
+                detail: newNoteDetail,
+                source: newNoteSource || 'web',
+                date: newNoteDate ? new Date(newNoteDate).toISOString() : new Date().toISOString()
+            };
+
+            if (editingNote) {
+                // Update existing note
+                // For updates, we usually just send the fields that changed, but API expects full object or partial
+                await api.updateNote(editingNote.id, {
+                    detail: newNoteDetail,
+                    source: newNoteSource,
+                    date: newNoteDate ? new Date(newNoteDate).toISOString() : editingNote.date
+                });
+                setSuccessMessage("Note updated successfully");
+            } else {
+                // Create new note
+                await api.createNote(noteData);
+                setSuccessMessage("Note added successfully");
+            }
+
+            setNewNoteDetail('');
+            setNewNoteSource('web');
+            setNewNoteDate('');
+            setEditingNote(null);
+            setIsNoteModalOpen(false);
+            fetchNotes(id);
+            setTimeout(() => setSuccessMessage(null), 2000);
+        } catch (err) {
+            console.error('Failed to save note', err);
+            setError(editingNote ? "Failed to update note" : "Failed to create note");
+        } finally {
+            setIsSubmitting(false);
+        }
+    };
+
+    const handleDeleteNote = async (noteId) => {
+        if (!confirm('Are you sure you want to delete this note?')) return;
+
+        try {
+            await api.deleteNote(noteId);
+            setSuccessMessage("Note deleted");
+            fetchNotes(id);
+            setTimeout(() => setSuccessMessage(null), 2000);
+        } catch (err) {
+            console.error('Failed to delete note', err);
+            setError("Failed to delete note");
+        }
+    };
 
     const fetchCaseData = async (caseId) => {
         try {
@@ -575,6 +650,80 @@ export default function CaseDetailPage(props) {
                         </div>
                     </div>
 
+                    {/* Notes Section */}
+                    <div className="bg-white dark:bg-zinc-900 rounded-lg shadow-sm border border-gray-200 dark:border-zinc-800">
+                        <div className="px-4 py-3 border-b border-gray-200 dark:border-zinc-800 bg-gray-50 dark:bg-zinc-800/50 flex justify-between items-center">
+                            <h3 className="text-sm font-semibold text-gray-500 uppercase tracking-wider">Notes</h3>
+                            <button
+                                onClick={() => {
+                                    setEditingNote(null);
+                                    setNewNoteDetail('');
+                                    setNewNoteSource('web');
+                                    // Default date to now
+                                    const d = new Date();
+                                    d.setMinutes(d.getMinutes() - d.getTimezoneOffset());
+                                    setNewNoteDate(d.toISOString().slice(0, 16));
+                                    setIsNoteModalOpen(true);
+                                }}
+                                className="text-xs flex items-center gap-1 bg-indigo-50 text-indigo-600 px-2 py-1 rounded hover:bg-indigo-100 dark:bg-zinc-800 dark:text-indigo-400 dark:hover:bg-zinc-700 transition-colors"
+                            >
+                                <Plus size={12} /> Add Note
+                            </button>
+                        </div>
+                        <div className="p-4">
+                            {notes.length > 0 ? (
+                                <div className="space-y-4">
+                                    {notes.map(note => (
+                                        <div key={note.id} className="group relative bg-white dark:bg-zinc-900 border border-gray-100 dark:border-zinc-800 p-3 rounded-lg hover:shadow-sm transition-shadow">
+                                            <div className="flex justify-between items-start mb-2">
+                                                <div className="flex items-center gap-2">
+                                                    <span className="text-xs font-medium text-gray-900 dark:text-gray-300 bg-gray-100 dark:bg-zinc-800 px-2 py-0.5 rounded-full capitalize">
+                                                        {note.source || 'Manual'}
+                                                    </span>
+                                                    <span className="text-xs text-gray-400">
+                                                        {new Date(note.date || note.created_at).toLocaleString()}
+                                                    </span>
+                                                </div>
+                                                <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                                                    <button
+                                                        onClick={() => {
+                                                            setEditingNote(note);
+                                                            setNewNoteDetail(note.detail);
+                                                            setNewNoteSource(note.source || 'web');
+                                                            // Format date for datetime-local input (YYYY-MM-DDThh:mm)
+                                                            const d = new Date(note.date || note.created_at || Date.now());
+                                                            d.setMinutes(d.getMinutes() - d.getTimezoneOffset());
+                                                            setNewNoteDate(d.toISOString().slice(0, 16));
+                                                            setIsNoteModalOpen(true);
+                                                        }}
+                                                        className="p-1 text-gray-400 hover:text-indigo-600"
+                                                        title="Edit Note"
+                                                    >
+                                                        <Pencil size={12} />
+                                                    </button>
+                                                    <button
+                                                        onClick={() => handleDeleteNote(note.id)}
+                                                        className="p-1 text-gray-400 hover:text-red-500"
+                                                        title="Delete Note"
+                                                    >
+                                                        <Trash2 size={12} />
+                                                    </button>
+                                                </div>
+                                            </div>
+                                            <p className="text-sm text-gray-700 dark:text-gray-300 whitespace-pre-wrap">
+                                                {note.detail}
+                                            </p>
+                                        </div>
+                                    ))}
+                                </div>
+                            ) : (
+                                <div className="text-center py-6 text-gray-400 text-sm">
+                                    No notes added yet.
+                                </div>
+                            )}
+                        </div>
+                    </div>
+
                     {/* System Events & Audit Log */}
                     <div className="bg-white dark:bg-zinc-900 rounded-lg shadow-sm border border-gray-200 dark:border-zinc-800">
                         <div className="px-4 py-3 border-b border-gray-200 dark:border-zinc-800 bg-gray-50 dark:bg-zinc-800/50">
@@ -674,6 +823,7 @@ export default function CaseDetailPage(props) {
             {/* Update Status Modal */}
             {isUpdateModalOpen && (
                 <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+                    {/* ... (existing modal content) ... */}
                     <div className="bg-white dark:bg-zinc-900 rounded-lg shadow-xl max-w-sm w-full p-6">
                         <h2 className="text-lg font-bold mb-4">Update Case Status</h2>
                         <form onSubmit={handleUpdateSubmit} className="space-y-4">
@@ -694,6 +844,59 @@ export default function CaseDetailPage(props) {
                                 <button type="button" onClick={() => setIsUpdateModalOpen(false)} className="px-3 py-2 text-gray-600 hover:text-gray-800">Cancel</button>
                                 <button type="submit" disabled={isSubmitting} className="px-3 py-2 bg-indigo-600 text-white rounded hover:bg-indigo-700 disabled:opacity-50">
                                     {isSubmitting ? 'Updating...' : 'Update Status'}
+                                </button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            )}
+
+            {/* Add/Edit Note Modal */}
+            {isNoteModalOpen && (
+                <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+                    <div className="bg-white dark:bg-zinc-900 rounded-lg shadow-xl max-w-md w-full p-6">
+                        <h2 className="text-lg font-bold mb-4">{editingNote ? 'Edit Note' : 'Add Note'}</h2>
+                        <form onSubmit={handleSaveNote} className="space-y-4">
+                            <div className="grid grid-cols-2 gap-4">
+                                <div>
+                                    <label className="block text-xs font-light text-gray-500 mb-1">Source</label>
+                                    <input
+                                        className="w-full px-3 py-2 border rounded dark:bg-zinc-800 dark:border-zinc-700 text-sm"
+                                        placeholder="e.g. web, email, phone"
+                                        value={newNoteSource}
+                                        onChange={e => setNewNoteSource(e.target.value)}
+                                    />
+                                </div>
+                                <div>
+                                    <label className="block text-xs font-light text-gray-500 mb-1">Date</label>
+                                    <input
+                                        type="datetime-local"
+                                        className="w-full px-3 py-2 border rounded dark:bg-zinc-800 dark:border-zinc-700 text-sm"
+                                        value={newNoteDate}
+                                        onChange={e => setNewNoteDate(e.target.value)}
+                                    />
+                                </div>
+                            </div>
+                            <div>
+                                <label className="block text-xs font-light text-gray-500 mb-1">Note Detail</label>
+                                <textarea
+                                    className="w-full px-3 py-2 border rounded dark:bg-zinc-800 dark:border-zinc-700 min-h-[100px]"
+                                    placeholder="Enter note details..."
+                                    value={newNoteDetail}
+                                    onChange={e => setNewNoteDetail(e.target.value)}
+                                    autoFocus
+                                />
+                            </div>
+                            <div className="flex justify-end gap-2 text-sm pt-2">
+                                <button type="button" onClick={() => {
+                                    setIsNoteModalOpen(false);
+                                    setEditingNote(null);
+                                    setNewNoteDetail('');
+                                    setNewNoteSource('web');
+                                    setNewNoteDate('');
+                                }} className="px-3 py-2 text-gray-600 hover:text-gray-800">Cancel</button>
+                                <button type="submit" disabled={isSubmitting || !newNoteDetail.trim()} className="px-3 py-2 bg-indigo-600 text-white rounded hover:bg-indigo-700 disabled:opacity-50">
+                                    {isSubmitting ? 'Saving...' : (editingNote ? 'Update Note' : 'Add Note')}
                                 </button>
                             </div>
                         </form>

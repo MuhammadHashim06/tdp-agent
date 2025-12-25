@@ -217,5 +217,46 @@ export const api = {
         });
         if (!response.ok) throw new Error('Failed to mark notifications as read');
         return response.json();
+    },
+
+    // Notes
+    createNote: async (data) => {
+        const response = await fetch(`${API_BASE_URL}/notes/`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(data),
+        });
+        if (!response.ok) throw new Error('Failed to create note');
+        return response.json();
+    },
+
+    getNotesByCaseId: async (caseId, limit = 100, skip = 0) => {
+        const response = await fetch(`${API_BASE_URL}/notes/case/${caseId}?limit=${limit}&skip=${skip}`);
+        if (!response.ok) throw new Error('Failed to fetch notes for case');
+        return response.json();
+    },
+
+    getNote: async (noteId) => {
+        const response = await fetch(`${API_BASE_URL}/notes/${noteId}`);
+        if (!response.ok) throw new Error('Failed to fetch note');
+        return response.json();
+    },
+
+    updateNote: async (noteId, data) => {
+        const response = await fetch(`${API_BASE_URL}/notes/${noteId}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(data),
+        });
+        if (!response.ok) throw new Error('Failed to update note');
+        return response.json();
+    },
+
+    deleteNote: async (noteId) => {
+        const response = await fetch(`${API_BASE_URL}/notes/${noteId}`, {
+            method: 'DELETE',
+        });
+        if (!response.ok) throw new Error('Failed to delete note');
+        return true; // or response.json() if API returns body
     }
 };

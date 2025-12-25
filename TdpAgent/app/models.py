@@ -126,3 +126,18 @@ class CaseEvent(Base):
     __table_args__ = (
         UniqueConstraint("case_id", "email_id", "event_type", name="uq_case_event_once"),
     )
+
+class Note(Base):
+    __tablename__ = "notes"
+
+    id = Column(Integer, primary_key=True)
+    case_id = Column(Integer, nullable=False)
+    date = Column(DateTime, default=utcnow, nullable=False)
+    source = Column(String(255), nullable=True)
+    detail = Column(Text, nullable=False)
+
+    created_at = Column(DateTime, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("case_id", "date", "source", name="uq_case_note"),
+    )
