@@ -3,13 +3,33 @@
 import { useState, useEffect } from 'react';
 import Link from 'next/link';
 import { api } from '../../../lib/api';
-import { RefreshCw, Search, Hash, User, FileText, Clock, Eye } from 'lucide-react';
+import { RefreshCw, Search, Hash, User, FileText, Clock, Eye, Filter, X } from 'lucide-react';
 
 export default function EmailListPage() {
     const [emails, setEmails] = useState([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
     const [searchTerm, setSearchTerm] = useState('');
+    const [activeFilters, setActiveFilters] = useState([]);
+
+    const FILTER_OPTIONS = [
+        { label: '@revivalhhc.org', value: 'revivalhhc.org', type: 'domain' },
+        { label: '@primehhs.com', value: 'primehhs.com', type: 'domain' },
+        { label: '@extendedhc.net', value: 'extendedhc.net', type: 'domain' },
+        { label: '@ehcny.org', value: 'ehcny.org', type: 'domain' },
+        { label: '@Americareny.com', value: 'Americareny.com', type: 'domain' },
+        { label: 'schedulingtdp', value: 'schedulingtdp@therapydepotonline.com', type: 'email' },
+        { label: 'services', value: 'services@therapydepotonline.com', type: 'email' },
+        { label: 'staffing', value: 'staffing@therapydepotonline.com', type: 'email' },
+    ];
+
+    const toggleFilter = (filterValue) => {
+        setActiveFilters(prev =>
+            prev.includes(filterValue)
+                ? prev.filter(f => f !== filterValue)
+                : [...prev, filterValue]
+        );
+    };
 
     useEffect(() => {
         fetchEmails();
@@ -77,11 +97,25 @@ export default function EmailListPage() {
 
     const filteredEmails = emails.filter(email => {
         const term = searchTerm.toLowerCase();
-        return (
+        const matchesSearch = (
             (email.sender_name && email.sender_name.toLowerCase().includes(term)) ||
             (email.sender && email.sender.toLowerCase().includes(term)) ||
             (email.subject && email.subject.toLowerCase().includes(term))
         );
+
+        if (activeFilters.length > 0) {
+            const matchesFilter = activeFilters.some(filter => {
+                const isEmailFilter = filter.includes('@therapydepotonline.com');
+                if (isEmailFilter) {
+                    return email.sender === filter; // Exact match for specific mailboxes
+                } else {
+                    return email.sender && email.sender.endsWith(filter); // Domain match
+                }
+            });
+            return matchesSearch && matchesFilter;
+        }
+
+        return matchesSearch;
     });
 
     if (loading) {
@@ -120,7 +154,9 @@ export default function EmailListPage() {
             </div>
 
             <div className="bg-white dark:bg-zinc-900 shadow-sm rounded-xl overflow-hidden border border-gray-200 dark:border-zinc-800">
-                <div className="p-4 border-b border-gray-100 dark:border-zinc-800">
+                {/* Filters and Search Bar */}
+                <div className="p-4 border-b border-gray-100 dark:border-zinc-800 flex flex-col gap-4">
+                    {/* Search Bar */}
                     <div className="relative w-full">
                         <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
                             <Search size={14} className="text-gray-400" />
@@ -132,6 +168,31 @@ export default function EmailListPage() {
                             value={searchTerm}
                             onChange={(e) => setSearchTerm(e.target.value)}
                         />
+                    </div>
+
+                    {/* Filter Pills */}
+                    <div className="flex flex-wrap gap-2 w-full">
+                        {FILTER_OPTIONS.map(option => (
+                            <button
+                                key={option.value}
+                                onClick={() => toggleFilter(option.value)}
+                                className={`px-3 py-1.5 text-xs font-medium rounded-full transition-all border ${activeFilters.includes(option.value)
+                                    ? 'bg-indigo-50 border-indigo-200 text-indigo-700 dark:bg-indigo-900/30 dark:border-indigo-800 dark:text-indigo-300 shadow-sm'
+                                    : 'bg-transparent border-transparent text-gray-500 hover:bg-gray-50 hover:text-gray-700 dark:hover:bg-zinc-800 dark:text-gray-400'
+                                    }`}
+                            >
+                                {option.label}
+                            </button>
+                        ))}
+                        {activeFilters.length > 0 && (
+                            <button
+                                onClick={() => setActiveFilters([])}
+                                className="px-3 py-1.5 rounded-full text-xs font-medium text-gray-500 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors flex items-center gap-1"
+                            >
+                                <X size={14} />
+                                Clear
+                            </button>
+                        )}
                     </div>
                 </div>
                 <div className="overflow-x-auto">

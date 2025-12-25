@@ -12,6 +12,8 @@ export default function LoginPage() {
     const handleLogin = (e) => {
         e.preventDefault();
         if (email === 'admin@tdpagent.com' && password === 'tdpagent') {
+            // Set simple auth cookie
+            document.cookie = "auth_token=true; path=/; max-age=86400; SameSite=Strict";
             router.push('/dashboard');
         } else {
             alert('Invalid credentials.');

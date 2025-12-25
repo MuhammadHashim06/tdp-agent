@@ -4,13 +4,16 @@
 'use client';
 
 import { useState, useEffect, use } from 'react';
+import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { api } from '../../../../lib/api';
+import { ArrowLeft } from 'lucide-react';
 
 export default function EmailDetailPage(props) {
     // Unwrap params using React.use()
     const params = use(props.params);
     const id = params.id;
+    const router = useRouter();
 
     const [email, setEmail] = useState(null);
     const [loading, setLoading] = useState(true);
@@ -101,9 +104,12 @@ export default function EmailDetailPage(props) {
                 <div className="flex justify-between items-start mb-4">
                     <h1 className="text-2xl font-bold text-gray-900 dark:text-white">{email.subject}</h1>
                     <div className="flex gap-2">
-                        <Link href="/dashboard/email" className="px-3 py-1 text-sm bg-gray-100 hover:bg-gray-200 dark:bg-zinc-800 dark:hover:bg-zinc-700 rounded text-gray-700 dark:text-gray-300 transition-colors">
-                            &larr; Back
-                        </Link>
+                        <button
+                            onClick={() => router.back()}
+                            className="px-3 py-1 text-sm bg-gray-100 hover:bg-gray-200 dark:bg-zinc-800 dark:hover:bg-zinc-700 rounded text-gray-700 dark:text-gray-300 transition-colors flex items-center gap-1"
+                        >
+                            <ArrowLeft size={16} /> Back
+                        </button>
                     </div>
                 </div>
                 <div className="flex items-center justify-between text-sm">
@@ -206,7 +212,7 @@ export default function EmailDetailPage(props) {
                                                 href={`/dashboard/draft/${draft.id}`}
                                                 className="px-3 py-1.5 bg-white border border-gray-300 text-gray-700 rounded hover:bg-gray-50 text-xs font-medium dark:bg-zinc-800 dark:border-zinc-700 dark:text-gray-200 dark:hover:bg-zinc-700"
                                             >
-                                                Edit
+                                                Open
                                             </Link>
                                         </div>
                                     </div>

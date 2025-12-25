@@ -3,10 +3,13 @@
 import { useState, useEffect, use } from 'react';
 import Link from 'next/link';
 import { api } from '../../../../lib/api';
+import { ArrowLeft } from 'lucide-react';
+import { useRouter } from 'next/navigation';
 
 export default function DraftDetailPage(props) {
     const params = use(props.params);
     const id = params.id;
+    const router = useRouter();
 
     const [draft, setDraft] = useState(null);
     const [loading, setLoading] = useState(true);
@@ -121,9 +124,15 @@ export default function DraftDetailPage(props) {
             {/* Header */}
             <div className="flex items-center justify-between mb-6">
                 <div className="flex items-center gap-4">
-                    <Link href="/dashboard/draft" className="text-indigo-600 hover:text-indigo-500">
+                    {/* <Link href="/dashboard/draft" className="text-indigo-600 hover:text-indigo-500">
                         &larr; Back
-                    </Link>
+                    </Link> */}
+                    <button
+                        onClick={() => router.back()}
+                        className="px-3 py-1 text-sm bg-gray-100 hover:bg-gray-200 dark:bg-zinc-800 dark:hover:bg-zinc-700 rounded text-gray-700 dark:text-gray-300 transition-colors flex items-center gap-1"
+                    >
+                        <ArrowLeft size={16} /> Back
+                    </button>
                     <h1 className="text-2xl font-bold text-gray-900 dark:text-white">Draft #{id}</h1>
                 </div>
                 <div className="flex items-center gap-4">

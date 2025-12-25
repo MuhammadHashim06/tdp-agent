@@ -3,6 +3,7 @@
 import { useState, useEffect, use } from 'react';
 import Link from 'next/link';
 import { api } from '../../../../lib/api';
+import { ArrowUp, ArrowUpRight, ArrowUpRightSquareIcon } from 'lucide-react';
 
 const ALLOWED_STATUSES_DEFAULT = [
     "new",
@@ -599,7 +600,7 @@ export default function CaseDetailPage(props) {
                                                 </div>
                                             )}
                                             <p className="text-sm text-gray-500 mt-1">
-                                                {item.body_preview} ....
+                                                {item.body_preview} .... <Link className='text-indigo-600 hover:text-indigo-800 text-xs font-medium' href={`/dashboard/email/${item.id}`} > View <ArrowUpRight className=' inline w-4 h-4' /> </Link>
                                             </p>
                                             {/* <button
                                                 onClick={() => setViewingPayload(item)}

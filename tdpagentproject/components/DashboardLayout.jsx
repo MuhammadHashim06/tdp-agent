@@ -213,7 +213,7 @@ import { useState, useEffect } from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { api } from '../lib/api';
-import { Home, FileText, Mail, Briefcase, Bell } from 'lucide-react';
+import { Home, FileText, Mail, Briefcase, Bell, LogOut } from 'lucide-react';
 
 export default function DashboardLayout({ children }) {
     const pathname = usePathname();
@@ -298,8 +298,8 @@ export default function DashboardLayout({ children }) {
                                 key={item.name}
                                 href={item.href}
                                 className={`flex items-center gap-3 px-4 py-3 rounded-xl transition-all duration-200 ${isActive
-                                        ? 'bg-indigo-50 text-indigo-600 font-semibold dark:bg-indigo-900/20 dark:text-indigo-400'
-                                        : 'text-gray-600 hover:bg-gray-50 dark:text-gray-400 dark:hover:bg-zinc-800'
+                                    ? 'bg-indigo-50 text-indigo-600 font-semibold dark:bg-indigo-900/20 dark:text-indigo-400'
+                                    : 'text-gray-600 hover:bg-gray-50 dark:text-gray-400 dark:hover:bg-zinc-800'
                                     }`}
                             >
                                 {item.icon}
@@ -315,8 +315,8 @@ export default function DashboardLayout({ children }) {
                         <button
                             onClick={() => setShowNotifications(!showNotifications)}
                             className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl transition-all duration-200 ${showNotifications
-                                    ? 'bg-gray-100 dark:bg-zinc-800 text-gray-900 dark:text-white'
-                                    : 'text-gray-600 hover:bg-gray-50 dark:text-gray-400 dark:hover:bg-zinc-800'
+                                ? 'bg-gray-100 dark:bg-zinc-800 text-gray-900 dark:text-white'
+                                : 'text-gray-600 hover:bg-gray-50 dark:text-gray-400 dark:hover:bg-zinc-800'
                                 }`}
                         >
                             <div className="relative">
@@ -358,10 +358,20 @@ export default function DashboardLayout({ children }) {
                         <div className="w-10 h-10 rounded-full bg-indigo-500 flex items-center justify-center text-white font-bold text-sm shrink-0">
                             A
                         </div>
-                        <div className="min-w-0">
+                        <div className="min-w-0 flex-1">
                             <p className="text-sm font-semibold text-gray-900 dark:text-white truncate">Tdp Agent</p>
                             <p className="text-[10px] text-gray-500 dark:text-gray-400 truncate">admin@tdpagent.com</p>
                         </div>
+                        <button
+                            onClick={() => {
+                                document.cookie = "auth_token=; path=/; max-age=0";
+                                window.location.href = '/login';
+                            }}
+                            className="p-2 text-gray-500 hover:text-red-500 transition-colors"
+                            title="Sign Out"
+                        >
+                            <LogOut size={18} />
+                        </button>
                     </div>
                 </div>
             </aside>
